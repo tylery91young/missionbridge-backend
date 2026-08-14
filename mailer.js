@@ -27,7 +27,7 @@ async function sendEmail(to, subject, text, html, emailType = 'general', trackin
   try {
     const response = await sgMail.send({
       to,
-      from: 'tyler@getmissionbridge.com',
+      from: { email: 'tyler@getmissionbridge.com', name: 'Mission Bridge Archive' },
       subject,
       text,
       html,
@@ -89,7 +89,7 @@ async function sendEmailViaGmail(to, subject, text, html, emailType = 'general',
 
   try {
     await gmailTransporter.sendMail({
-      from: process.env.GMAIL_USER,
+      from: `"Mission Bridge Archive" <${process.env.GMAIL_USER}>`,
       to,
       subject,
       text,

@@ -135,7 +135,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // Health check - so we can confirm the server is alive
 app.get('/', (req, res) => {
-  res.send('Mission Bridge backend is running.');
+  res.send('Mission Bridge Archive backend is running.');
 });
 
 // This is the URL SendGrid's Inbound Parse POSTs to
@@ -410,7 +410,7 @@ app.post('/find-dashboard', async (req, res) => {
 
         await sendEmail(
           searchEmail,
-          'Your Mission Bridge dashboard link',
+          'Your Mission Bridge Archive dashboard link',
           `Here's your dashboard link for ${name}: ${dashboardUrl}`,
           `<p>Here's your dashboard link for <strong>${name}</strong>:</p><p><a href="${dashboardUrl}">${dashboardUrl}</a></p><p>If you didn't request this, you can safely ignore this email.</p>`,
           'dashboard_recovery'
@@ -733,12 +733,12 @@ app.post('/signup', async (req, res) => {
         await sendEmail(
           cleanFamilyEmail,
           "You're on the list - here's your setup link for later",
-          `Thanks for reserving your spot with Mission Bridge!\n\n` +
+          `Thanks for reserving your spot with Mission Bridge Archive!\n\n` +
           `Once you have your missionary's mission call and email address, just come back to this link to finish setting things up - it takes about a minute:\n\n` +
           `${completeUrl}\n\n` +
           `We'll keep your spot reserved either way. Save this email so you don't lose the link.\n\n` +
           `Questions in the meantime? Email tyler@getmissionbridge.com anytime.`,
-          `<p>Thanks for reserving your spot with Mission Bridge!</p>` +
+          `<p>Thanks for reserving your spot with Mission Bridge Archive!</p>` +
           `<p>Once you have your missionary's mission call and email address, just come back to this link to finish setting things up - it takes about a minute:</p>` +
           `<p><a href="${completeUrl}">${completeUrl}</a></p>` +
           `<p>We'll keep your spot reserved either way. Save this email so you don't lose the link.</p>` +
@@ -800,8 +800,8 @@ app.post('/signup', async (req, res) => {
         price_data: {
           currency: 'usd',
           product_data: {
-            name: 'Mission Bridge Archive',
-            description: m.missionary_name ? `${m.missionary_name}'s mission archive` : 'Mission archive access',
+            name: 'The Bridge',
+            description: m.missionary_name ? `${m.missionary_name}'s mission archive · Mission Bridge Archive` : 'Mission archive access · Mission Bridge Archive',
           },
           unit_amount: currentPriceCents,
         },
@@ -872,8 +872,8 @@ app.post('/signup/complete', async (req, res) => {
         price_data: {
           currency: 'usd',
           product_data: {
-            name: 'Mission Bridge Archive',
-            description: row.missionary_name ? `${row.missionary_name}'s mission archive` : 'Mission archive access',
+            name: 'The Bridge',
+            description: row.missionary_name ? `${row.missionary_name}'s mission archive · Mission Bridge Archive` : 'Mission archive access · Mission Bridge Archive',
           },
           unit_amount: currentPriceCents,
         },
@@ -933,8 +933,8 @@ async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, 
   try {
     await sendEmail(
       cleanFamilyEmail,
-      'Welcome to Mission Bridge - here\'s what to do next',
-      `Hi! I'm Tyler, the person behind Mission Bridge. Thanks so much for giving this a try.\n\n` +
+      'Welcome to Mission Bridge Archive - here\'s what to do next',
+      `Hi! I'm Tyler, the person behind Mission Bridge Archive. Thanks so much for giving this a try.\n\n` +
       `Here's exactly what happens next:\n\n` +
       `1. Tell your missionary to add this address to their regular email list: archive@parse.getmissionbridge.com. ` +
       `Any time they send their update home (with that address included), everything they write, plus any photos or voice memos they attach, gets saved automatically. Nothing else for them to do.\n\n` +
@@ -942,10 +942,10 @@ async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, 
       `2. Your dashboard: ${dashboardUrl}\n` +
       `Save this link somewhere you'll remember, like your bookmarks bar or a note on your phone. There's no password. This exact link is the only way anyone sees your missionary's dashboard, so keep it private and only share it with people you trust.\n\n` +
       `3. Set up Google Photos Partner Sharing too: ${guideUrl}\n` +
-      `Mission Bridge saves everything they email home, but their phone holds a lot more photos than they'll ever email. Partner Sharing is the most foolproof way to catch everything else, and it's much easier to set up now than to fix it after the fact.${midMissionNote}\n\n` +
+      `Mission Bridge Archive saves everything they email home, but their phone holds a lot more photos than they'll ever email. Partner Sharing is the most foolproof way to catch everything else, and it's much easier to set up now than to fix it after the fact.${midMissionNote}\n\n` +
       `4. If anything looks off, an update doesn't show up, or you just have a question, email me anytime at tyler@getmissionbridge.com. I'd genuinely rather hear from you than have you wonder.\n\n` +
       `I built this because I wanted families to have one less thing to worry about during a mission. I hope it gives you some peace of mind.`,
-      `<p>Hi! I'm Tyler, the person behind Mission Bridge.</p>` +
+      `<p>Hi! I'm Tyler, the person behind Mission Bridge Archive.</p>` +
       `<p>Thanks so much for giving this a try.</p>` +
       `<p><strong>Here's exactly what happens next:</strong></p>` +
       `<p><strong>1. Tell your missionary to add this address to their regular email list:</strong><br>` +
@@ -957,7 +957,7 @@ async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, 
       `Save this link somewhere you'll remember, like your bookmarks bar or a note on your phone. There's no password. This exact link is the only way anyone sees your missionary's dashboard, so keep it private and only share it with people you trust.</p>` +
       `<p><strong>3. Set up Google Photos Partner Sharing too:</strong><br>` +
       `<a href="${guideUrl}">${guideUrl}</a><br>` +
-      `Mission Bridge saves everything they email home, but their phone holds a lot more photos than they'll ever email. Partner Sharing is the most foolproof way to catch everything else, and it's much easier to set up now than to fix it after the fact.</p>` +
+      `Mission Bridge Archive saves everything they email home, but their phone holds a lot more photos than they'll ever email. Partner Sharing is the most foolproof way to catch everything else, and it's much easier to set up now than to fix it after the fact.</p>` +
       midMissionNoteHtml +
       `<p><strong>4. If anything looks off,</strong> an update doesn't show up, or you just have a question, email me anytime at <a href="mailto:tyler@getmissionbridge.com">tyler@getmissionbridge.com</a>. I'd genuinely rather hear from you than have you wonder.</p>` +
       `<p>I built this because I wanted families to have one less thing to worry about during a mission. I hope it gives you some peace of mind.</p>`,
@@ -983,7 +983,7 @@ async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, 
       cleanMissionaryEmail,
       'Your family set this up to save your emails home',
       `Hi${firstName ? ' ' + firstName : ''},\n\n` +
-      `Your family signed up for Mission Bridge, a free tool that automatically saves your emails, photos, and voice memos so nothing gets lost while you're serving.\n\n` +
+      `Your family signed up for Mission Bridge Archive, a free tool that automatically saves your emails, photos, and voice memos so nothing gets lost while you're serving.\n\n` +
       `All you need to do: add this address to your regular email list, the same way you'd add anyone else you send your update to:\n\n` +
       `archive@parse.getmissionbridge.com\n\n` +
       `That's it for emails. Any time you email your update home with that address included, your message and anything you attach gets saved automatically. No app to download, nothing else to set up.\n\n` +
@@ -996,7 +996,7 @@ async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, 
       `If you got this and everything makes sense, tap this link so we know it reached you: ${confirmUrl}\n\n` +
       `Questions? Your family can reach out to tyler@getmissionbridge.com anytime.`,
       `<p>Hi${firstName ? ' ' + firstName : ''},</p>` +
-      `<p>Your family signed up for Mission Bridge, a free tool that automatically saves your emails, photos, and voice memos so nothing gets lost while you're serving.</p>` +
+      `<p>Your family signed up for Mission Bridge Archive, a free tool that automatically saves your emails, photos, and voice memos so nothing gets lost while you're serving.</p>` +
       `<p><strong>All you need to do:</strong> add this address to your regular email list, the same way you'd add anyone else you send your update to:</p>` +
       `<p><code>archive@parse.getmissionbridge.com</code></p>` +
       `<p>That's it for emails. Any time you email your update home with that address included, your message and anything you attach gets saved automatically. No app to download, nothing else to set up.</p>` +
@@ -1256,8 +1256,8 @@ app.post('/admin/customers/:id/create-payment-link', requireAdminKey, async (req
         price_data: {
           currency: 'usd',
           product_data: {
-            name: 'Mission Bridge Archive',
-            description: m.missionary_name ? `${m.missionary_name}'s mission archive` : 'Mission archive access',
+            name: 'The Bridge',
+            description: m.missionary_name ? `${m.missionary_name}'s mission archive · Mission Bridge Archive` : 'Mission archive access · Mission Bridge Archive',
           },
           unit_amount: Math.round(amount * 100),
         },
@@ -1544,7 +1544,7 @@ async function checkAndSendEndOfMissionEmails() {
         ? `Welcome home, ${firstName}! A few things to wrap up`
         : `Still a few things left on ${firstName}'s end-of-mission checklist`;
       const familyText = isFirstSend
-        ? `Welcome home! Now that ${firstName}'s mission is wrapping up, there are a few things worth doing before we eventually wind down their Mission Bridge account:\n\n` +
+        ? `Welcome home! Now that ${firstName}'s mission is wrapping up, there are a few things worth doing before we eventually wind down their Mission Bridge Archive account:\n\n` +
           `1. Double check Google Photos Partner Sharing actually captured everything (a quick guide is linked in the checklist below)\n` +
           `2. Download anything from the archive you want to keep for good\n` +
           `3. Confirm you're ready for us to close things out\n\n` +
@@ -1553,7 +1553,7 @@ async function checkAndSendEndOfMissionEmails() {
         : `Just a friendly nudge, since a few items are still unchecked on ${firstName}'s end-of-mission checklist: ${checklistUrl}\n\n` +
           `We'll keep checking in about once a week until everything's confirmed. No rush, just don't want anything to slip through the cracks.`;
       const familyHtml = isFirstSend
-        ? `<p>Welcome home! Now that ${firstName}'s mission is wrapping up, there are a few things worth doing before we eventually wind down their Mission Bridge account:</p>` +
+        ? `<p>Welcome home! Now that ${firstName}'s mission is wrapping up, there are a few things worth doing before we eventually wind down their Mission Bridge Archive account:</p>` +
           `<ol><li>Double check Google Photos Partner Sharing actually captured everything (a quick guide is linked in the checklist below)</li>` +
           `<li>Download anything from the archive you want to keep for good</li>` +
           `<li>Confirm you're ready for us to close things out</li></ol>` +
@@ -1569,14 +1569,14 @@ async function checkAndSendEndOfMissionEmails() {
       }
 
       const missionarySubject = isFirstSend
-        ? `Welcome home! Wrapping up your Mission Bridge archive`
+        ? `Welcome home! Wrapping up your Mission Bridge Archive account`
         : `A few things left on your end-of-mission checklist`;
       const missionaryText = isFirstSend
-        ? `Welcome home! Your family has a simple checklist to work through before your Mission Bridge archive eventually gets wound down, including making sure your photos are backed up and everything's downloaded: ${checklistUrl}\n\n` +
+        ? `Welcome home! Your family has a simple checklist to work through before your Mission Bridge Archive account eventually gets wound down, including making sure your photos are backed up and everything's downloaded: ${checklistUrl}\n\n` +
           `No rush at all.`
         : `Just a nudge that a few items are still open on the end-of-mission checklist your family's working through: ${checklistUrl}`;
       const missionaryHtml = isFirstSend
-        ? `<p>Welcome home! Your family has a simple checklist to work through before your Mission Bridge archive eventually gets wound down, including making sure your photos are backed up and everything's downloaded: <a href="${checklistUrl}">${checklistUrl}</a></p><p>No rush at all.</p>`
+        ? `<p>Welcome home! Your family has a simple checklist to work through before your Mission Bridge Archive account eventually gets wound down, including making sure your photos are backed up and everything's downloaded: <a href="${checklistUrl}">${checklistUrl}</a></p><p>No rush at all.</p>`
         : `<p>Just a nudge that a few items are still open on the end-of-mission checklist your family's working through: <a href="${checklistUrl}">${checklistUrl}</a></p>`;
 
       try {
@@ -1738,10 +1738,10 @@ async function checkAndSendPreorderNudge() {
         await sendEmail(
           m.family_email,
           'Got your missionary\'s call yet?',
-          `Hi! Just checking in, you reserved your spot with Mission Bridge a while back before having your missionary's mission call and email.\n\n` +
+          `Hi! Just checking in, you reserved your spot with Mission Bridge Archive a while back before having your missionary's mission call and email.\n\n` +
           `If you have their info now, finish setting up here, takes about a minute: ${completeUrl}\n\n` +
           `If not yet, no rush at all, we'll check in again in a few weeks. Your spot's still reserved either way.`,
-          `<p>Hi! Just checking in, you reserved your spot with Mission Bridge a while back before having your missionary's mission call and email.</p>` +
+          `<p>Hi! Just checking in, you reserved your spot with Mission Bridge Archive a while back before having your missionary's mission call and email.</p>` +
           `<p>If you have their info now, finish setting up here, takes about a minute:</p>` +
           `<p><a href="${completeUrl}">${completeUrl}</a></p>` +
           `<p>If not yet, no rush at all, we'll check in again in a few weeks. Your spot's still reserved either way.</p>`,
@@ -1767,7 +1767,7 @@ const PORT = process.env.PORT || 3000;
 initDb()
   .then(() => {
     app.listen(PORT, () => {
-      console.log(`Mission Bridge backend listening on port ${PORT}`);
+      console.log(`Mission Bridge Archive backend listening on port ${PORT}`);
     });
 
     // Run shortly after startup (don't block server boot on it), then
