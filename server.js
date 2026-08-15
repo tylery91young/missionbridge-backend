@@ -39,6 +39,41 @@ async function getFoundingStatus() {
 const app = express();
 const upload = multer({ dest: '/tmp/uploads/' });
 
+// Render sits in front of this as a reverse proxy - without this,
+// req.ip would reflect Render's proxy rather than the real visitor,
+// which would make per-IP rate limiting below useless (everyone would
+// share the same "IP").
+app.set('trust proxy', true);
+
+// Lightweight in-memory rate limiter - no new dependency needed for a
+// single-instance server like this one. Tracks request timestamps per
+// IP in a sliding window; would need a shared store (Redis) only if
+// this ever ran as multiple instances behind a load balancer.
+const rateLimitBuckets = new Map();
+function rateLimit({ windowMs, max, message }) {
+  return (req, res, next) => {
+    const key = req.ip || 'unknown';
+    const now = Date.now();
+    const recent = (rateLimitBuckets.get(key) || []).filter(t => now - t < windowMs);
+    if (recent.length >= max) {
+      return res.status(429).json({ error: message || 'Too many requests, please try again shortly.' });
+    }
+    recent.push(now);
+    rateLimitBuckets.set(key, recent);
+    next();
+  };
+}
+// Periodic sweep so IPs that stop making requests don't sit in memory
+// forever - not load-bearing, just housekeeping at this scale.
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, times] of rateLimitBuckets) {
+    const recent = times.filter(t => now - t < 15 * 60 * 1000);
+    if (recent.length === 0) rateLimitBuckets.delete(key);
+    else rateLimitBuckets.set(key, recent);
+  }
+}, 60 * 60 * 1000);
+
 // Some email clients send a generic mimetype instead of the real one.
 // This fills in the correct type based on file extension as a backup.
 function resolveMimeType(originalMimeType, filename) {
@@ -107,7 +142,8 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
               missionaryName: m.missionary_name,
               familyEmail: m.family_email,
               missionStartDate: m.mission_start_date,
-              missionStatus: m.mission_status
+              missionStatus: m.mission_status,
+              dashboardToken: m.dashboard_token
             });
             console.log(`Sent onboarding emails after confirmed payment for missionary #${missionaryId}`);
           } catch (mailErr) {
@@ -123,6 +159,113 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
   }
 
   res.json({ received: true });
+});
+
+// Verifies SendGrid's Event Webhook signature (ECDSA over the raw
+// timestamp+body), per their documented Signed Event Webhook scheme.
+// Only called when SENDGRID_EVENT_WEBHOOK_PUBLIC_KEY is configured -
+// see the route below for what happens when it isn't.
+function verifySendGridEventSignature(publicKeyBase64, payload, signature, timestamp) {
+  try {
+    const publicKey = crypto.createPublicKey({
+      key: Buffer.from(publicKeyBase64, 'base64'),
+      format: 'der',
+      type: 'spki',
+    });
+    const verifier = crypto.createVerify('SHA256');
+    verifier.update(timestamp + payload);
+    verifier.end();
+    return verifier.verify(publicKey, Buffer.from(signature, 'base64'));
+  } catch (err) {
+    console.error('Error verifying SendGrid event webhook signature:', err.message);
+    return false;
+  }
+}
+
+// Receives real delivery outcomes from SendGrid's Event Webhook
+// (bounces, drops, deliveries) - separate from our own inbound
+// /webhook for missionary emails. This is what actually tells us
+// when something we sent didn't land, instead of only knowing that
+// SendGrid initially accepted the send request.
+//
+// Registered here (before express.json(), like /webhook/stripe above)
+// and using express.raw() for the same reason: signature verification
+// needs the untouched raw body bytes, not the already-parsed object.
+//
+// SENDGRID_EVENT_WEBHOOK_PUBLIC_KEY is optional - if it's not set
+// (i.e. SendGrid's "Signed Event Webhook" feature hasn't been turned
+// on yet in their dashboard), verification is skipped entirely and
+// this behaves exactly as it did before. Nothing breaks either way;
+// it just isn't protected against spoofed events until that's set up.
+app.post('/webhook/sendgrid-events', express.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    const rawBody = req.body.toString('utf8');
+
+    if (process.env.SENDGRID_EVENT_WEBHOOK_PUBLIC_KEY) {
+      const signature = req.headers['x-twilio-email-event-webhook-signature'];
+      const timestamp = req.headers['x-twilio-email-event-webhook-timestamp'];
+      const isValid = signature && timestamp && verifySendGridEventSignature(
+        process.env.SENDGRID_EVENT_WEBHOOK_PUBLIC_KEY, rawBody, signature, timestamp
+      );
+      if (!isValid) {
+        console.warn('Rejected SendGrid event webhook: missing or invalid signature');
+        return res.status(401).send('Unauthorized');
+      }
+    }
+
+    let events;
+    try {
+      events = JSON.parse(rawBody);
+    } catch (parseErr) {
+      console.error('Error parsing SendGrid event webhook body:', parseErr.message);
+      return res.status(400).send('Invalid JSON');
+    }
+    events = Array.isArray(events) ? events : [];
+
+    console.log(`SendGrid event webhook hit: received ${events.length} event(s)`);
+    const deliveryTypes = ['bounce', 'dropped', 'delivered', 'blocked', 'deferred'];
+    const engagementTypes = ['open', 'click'];
+
+    for (const event of events) {
+      if (!event.sg_message_id) {
+        console.log(`SendGrid event received with no sg_message_id: ${event.event}`);
+        continue;
+      }
+
+      if (deliveryTypes.includes(event.event)) {
+        const detail = event.reason || event.response || null;
+        // SendGrid's webhook message ID sometimes has extra characters
+        // appended beyond the ID we captured at send time, so match on
+        // our stored ID being a prefix of the incoming one.
+        const result = await pool.query(
+          `UPDATE email_log
+           SET delivery_status = $1, delivery_detail = $2, delivery_updated_at = NOW()
+           WHERE $3 LIKE sg_message_id || '%' AND sg_message_id IS NOT NULL`,
+          [event.event, detail, event.sg_message_id]
+        );
+        console.log(`SendGrid event "${event.event}" for message_id ${event.sg_message_id}: matched ${result.rowCount} row(s)`);
+      } else if (engagementTypes.includes(event.event)) {
+        // Kept in their own columns rather than delivery_status, so an
+        // "opened" event can never overwrite a meaningful outcome like
+        // "bounced" that arrived earlier.
+        const column = event.event === 'open' ? 'opened_at' : 'clicked_at';
+        const result = await pool.query(
+          `UPDATE email_log
+           SET ${column} = COALESCE(${column}, NOW())
+           WHERE $1 LIKE sg_message_id || '%' AND sg_message_id IS NOT NULL`,
+          [event.sg_message_id]
+        );
+        console.log(`SendGrid event "${event.event}" for message_id ${event.sg_message_id}: matched ${result.rowCount} row(s)`);
+      } else {
+        console.log(`SendGrid event type not handled: ${event.event}`);
+      }
+    }
+
+    res.status(200).send('OK');
+  } catch (err) {
+    console.error('Error processing SendGrid event webhook:', err);
+    res.status(500).send('Error processing events');
+  }
 });
 
 // Allow requests from the landing page domain specifically
@@ -142,6 +285,17 @@ app.get('/', (req, res) => {
 // every time an email arrives at parse.getmissionbridge.com
 app.post('/webhook', upload.any(), async (req, res) => {
   try {
+    // Optional shared-secret check: SendGrid's Inbound Parse doesn't
+    // sign requests the way the Event Webhook does, so this is the
+    // available mitigation - only takes effect once INBOUND_PARSE_SECRET
+    // is set AND SendGrid's Inbound Parse destination URL is updated to
+    // append ?secret=<the same value>. Until both of those are done,
+    // this is skipped and nothing changes.
+    if (process.env.INBOUND_PARSE_SECRET && req.query.secret !== process.env.INBOUND_PARSE_SECRET) {
+      console.warn('Rejected inbound webhook request with missing/incorrect secret');
+      return res.status(401).send('Unauthorized');
+    }
+
     const from = req.body.from || 'unknown sender';
     const subject = req.body.subject || '(no subject)';
     const text = req.body.text || req.body.html || '(no message body)';
@@ -189,11 +343,15 @@ app.post('/webhook', upload.any(), async (req, res) => {
     else if (hasPhotosLink) detectedIssueType = 'photos_album_link';
     else if (hasDriveLink) detectedIssueType = 'drive_file_link';
 
-    // Save the email itself to the database
+    // Save the email itself to the database. sender_email is the
+    // exact, parsed address (cleanFromAddress) - used for exact-match
+    // lookups everywhere instead of a LIKE '%...%' against the raw
+    // from_address header, which could match a different missionary
+    // whose address happened to be a substring of another's.
     const result = await pool.query(
-      `INSERT INTO emails (from_address, subject, body_text, has_drive_link, detected_issue_type, is_mostly_link)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-      [from, subject, text, hasAnyUnparseableLink, detectedIssueType, isMostlyJustALink]
+      `INSERT INTO emails (from_address, sender_email, subject, body_text, has_drive_link, detected_issue_type, is_mostly_link)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+      [from, cleanFromAddress, subject, text, hasAnyUnparseableLink, detectedIssueType, isMostlyJustALink]
     );
     const emailId = result.rows[0].id;
 
@@ -246,7 +404,7 @@ app.post('/webhook', upload.any(), async (req, res) => {
     if (missionary) {
       try {
         const countResult = await pool.query(
-          `SELECT id FROM emails WHERE LOWER(from_address) LIKE '%' || $1 || '%' AND is_deleted = FALSE`,
+          `SELECT id FROM emails WHERE sender_email = $1 AND is_deleted = FALSE`,
           [missionary.missionary_email]
         );
         const allEmailIds = countResult.rows.map(r => r.id);
@@ -262,7 +420,9 @@ app.post('/webhook', upload.any(), async (req, res) => {
           );
           const photoCount = parseInt(attachmentCounts.rows[0].photos, 10) || 0;
           const voiceCount = parseInt(attachmentCounts.rows[0].voice_memos, 10) || 0;
-          const dashboardUrl = `https://getmissionbridge.com/dashboard.html?email=${encodeURIComponent(missionary.missionary_email)}`;
+          const dashboardUrl = missionary.dashboard_token
+            ? `https://getmissionbridge.com/dashboard.html?token=${encodeURIComponent(missionary.dashboard_token)}`
+            : `https://getmissionbridge.com/dashboard.html?email=${encodeURIComponent(missionary.missionary_email)}`;
           const name = missionary.missionary_name || 'your missionary';
 
           await sendEmail(
@@ -287,61 +447,6 @@ app.post('/webhook', upload.any(), async (req, res) => {
     res.status(500).send('Error processing email');
   }
 });
-
-// Receives real delivery outcomes from SendGrid's Event Webhook
-// (bounces, drops, deliveries) - separate from our own inbound
-// /webhook for missionary emails. This is what actually tells us
-// when something we sent didn't land, instead of only knowing that
-// SendGrid initially accepted the send request.
-app.post('/webhook/sendgrid-events', async (req, res) => {
-  try {
-    const events = Array.isArray(req.body) ? req.body : [];
-    console.log(`SendGrid event webhook hit: received ${events.length} event(s)`);
-    const deliveryTypes = ['bounce', 'dropped', 'delivered', 'blocked', 'deferred'];
-    const engagementTypes = ['open', 'click'];
-
-    for (const event of events) {
-      if (!event.sg_message_id) {
-        console.log(`SendGrid event received with no sg_message_id: ${event.event}`);
-        continue;
-      }
-
-      if (deliveryTypes.includes(event.event)) {
-        const detail = event.reason || event.response || null;
-        // SendGrid's webhook message ID sometimes has extra characters
-        // appended beyond the ID we captured at send time, so match on
-        // our stored ID being a prefix of the incoming one.
-        const result = await pool.query(
-          `UPDATE email_log
-           SET delivery_status = $1, delivery_detail = $2, delivery_updated_at = NOW()
-           WHERE $3 LIKE sg_message_id || '%' AND sg_message_id IS NOT NULL`,
-          [event.event, detail, event.sg_message_id]
-        );
-        console.log(`SendGrid event "${event.event}" for message_id ${event.sg_message_id}: matched ${result.rowCount} row(s)`);
-      } else if (engagementTypes.includes(event.event)) {
-        // Kept in their own columns rather than delivery_status, so an
-        // "opened" event can never overwrite a meaningful outcome like
-        // "bounced" that arrived earlier.
-        const column = event.event === 'open' ? 'opened_at' : 'clicked_at';
-        const result = await pool.query(
-          `UPDATE email_log
-           SET ${column} = COALESCE(${column}, NOW())
-           WHERE $1 LIKE sg_message_id || '%' AND sg_message_id IS NOT NULL`,
-          [event.sg_message_id]
-        );
-        console.log(`SendGrid event "${event.event}" for message_id ${event.sg_message_id}: matched ${result.rowCount} row(s)`);
-      } else {
-        console.log(`SendGrid event type not handled: ${event.event}`);
-      }
-    }
-
-    res.status(200).send('OK');
-  } catch (err) {
-    console.error('Error processing SendGrid event webhook:', err);
-    res.status(500).send('Error processing events');
-  }
-});
-
 
 // A 1x1 transparent GIF, returned for every open-pixel hit regardless
 // of whether the token matched anything - never error out on this,
@@ -389,7 +494,7 @@ app.get('/track/confirm/:token', async (req, res) => {
 
 // For security, we email the link rather than displaying it directly,
 // so only someone with real access to that inbox can get in.
-app.post('/find-dashboard', async (req, res) => {
+app.post('/find-dashboard', rateLimit({ windowMs: 15 * 60 * 1000, max: 5, message: 'Too many attempts. Please try again in a few minutes.' }), async (req, res) => {
   try {
     const searchEmail = (req.body.email || '').toLowerCase().trim();
     if (!searchEmail) {
@@ -405,7 +510,9 @@ app.post('/find-dashboard', async (req, res) => {
     // so this endpoint can't be used to check which emails are in our system.
     if (result.rows.length > 0) {
       for (const m of result.rows) {
-        const dashboardUrl = `https://getmissionbridge.com/dashboard.html?email=${encodeURIComponent(m.missionary_email)}`;
+        const dashboardUrl = m.dashboard_token
+          ? `https://getmissionbridge.com/dashboard.html?token=${encodeURIComponent(m.dashboard_token)}`
+          : `https://getmissionbridge.com/dashboard.html?email=${encodeURIComponent(m.missionary_email)}`;
         const name = m.missionary_name || 'your missionary';
 
         await sendEmail(
@@ -440,7 +547,9 @@ app.get('/checklist/:token', async (req, res) => {
     const m = result.rows[0];
     res.json({
       missionaryName: m.missionary_name,
-      dashboardUrl: `https://getmissionbridge.com/dashboard.html?email=${encodeURIComponent(m.missionary_email)}`,
+      dashboardUrl: m.dashboard_token
+        ? `https://getmissionbridge.com/dashboard.html?token=${encodeURIComponent(m.dashboard_token)}`
+        : `https://getmissionbridge.com/dashboard.html?email=${encodeURIComponent(m.missionary_email)}`,
       photoGuideUrl: 'https://getmissionbridge.com/photo-guide.html',
       checklistPhotosConfirmed: m.checklist_photos_confirmed,
       checklistDownloadsConfirmed: m.checklist_downloads_confirmed,
@@ -484,95 +593,133 @@ app.post('/checklist/:token', async (req, res) => {
   }
 });
 
+// Shared by both dashboard routes below (the legacy email-based one
+// and the newer token-based one) so the actual data-building logic
+// only lives in one place.
+async function buildDashboardPayload(missionaryEmail, { logView }) {
+  const missionaryResult = await pool.query(
+    `SELECT * FROM missionaries WHERE missionary_email = $1`,
+    [missionaryEmail]
+  );
+  const missionary = missionaryResult.rows[0] || null;
+
+  if (missionary && missionary.is_removed) {
+    return { removed: true };
+  }
+
+  // Log this view for engagement tracking - don't let a logging
+  // failure ever break the actual dashboard load. Skipped entirely
+  // when opened from the admin panel's preview link (adminPreview
+  // query param), so Tyler checking on a customer doesn't get
+  // counted as real family engagement.
+  if (logView) {
+    try {
+      await pool.query(
+        `INSERT INTO dashboard_views (missionary_email) VALUES ($1)`,
+        [missionaryEmail]
+      );
+    } catch (logErr) {
+      console.error('Error logging dashboard view:', logErr);
+    }
+  }
+
+  const emails = await pool.query(
+    `SELECT * FROM emails WHERE sender_email = $1 AND is_deleted = FALSE ORDER BY received_at DESC`,
+    [missionaryEmail]
+  );
+  const emailIds = emails.rows.map(e => e.id);
+  const attachments = emailIds.length
+    ? await pool.query(`SELECT * FROM attachments WHERE email_id = ANY($1) AND is_deleted = FALSE`, [emailIds])
+    : { rows: [] };
+
+  // Build each email "moment" with its attachments categorized and
+  // given a real, temporary viewable URL.
+  const moments = await Promise.all(
+    emails.rows.map(async (email) => {
+      const emailAttachments = attachments.rows.filter(a => a.email_id === email.id);
+
+      const withUrls = await Promise.all(
+        emailAttachments.map(async (a) => {
+          const url = await getSignedFileUrl(a.saved_as);
+          const ext = a.original_name.split('.').pop().toLowerCase();
+
+          let category = 'other';
+          if (a.mime_type.startsWith('image/')) category = 'photo';
+          else if (a.mime_type.startsWith('audio/')) category = 'audio';
+          else if (a.mime_type.startsWith('video/')) category = 'video';
+          // Fallback: some old records or unusual email clients send a
+          // generic mimetype - use the file extension as backup.
+          else if (['jpg','jpeg','png','heic','gif','webp'].includes(ext)) category = 'photo';
+          else if (['m4a','mp3','wav','aac','ogg'].includes(ext)) category = 'audio';
+          else if (['mp4','mov'].includes(ext)) category = 'video';
+
+          return { ...a, url, category };
+        })
+      );
+
+      return {
+        id: email.id,
+        subject: email.subject,
+        text: email.body_text,
+        receivedAt: email.received_at,
+        hasDriveLink: email.has_drive_link || false,
+        detectedIssueType: email.detected_issue_type || null,
+        isMostlyLink: email.is_mostly_link || false,
+        photos: withUrls.filter(a => a.category === 'photo'),
+        audio: withUrls.filter(a => a.category === 'audio'),
+        videos: withUrls.filter(a => a.category === 'video'),
+        other: withUrls.filter(a => a.category === 'other'),
+      };
+    })
+  );
+
+  return {
+    missionary,
+    totalMoments: moments.length,
+    totalPhotos: moments.reduce((sum, m) => sum + m.photos.length, 0),
+    totalAudio: moments.reduce((sum, m) => sum + m.audio.length, 0),
+    moments,
+  };
+}
+
+// Legacy route - still uses the missionary's actual email address as
+// the identifier. Kept working indefinitely so links already sent in
+// real emails never break. New signups get a dashboard_token instead
+// (see /dashboard/by-token below), which isn't guessable the way an
+// email address is.
 app.get('/dashboard/:missionaryEmail', async (req, res) => {
   try {
     const missionaryEmail = req.params.missionaryEmail.toLowerCase().trim();
-
-    const missionaryResult = await pool.query(
-      `SELECT * FROM missionaries WHERE missionary_email = $1`,
-      [missionaryEmail]
-    );
-    const missionary = missionaryResult.rows[0] || null;
-
-    if (missionary && missionary.is_removed) {
+    const payload = await buildDashboardPayload(missionaryEmail, { logView: req.query.adminPreview !== '1' });
+    if (payload.removed) {
       return res.status(403).json({ error: 'This account is no longer active.' });
     }
-
-    // Log this view for engagement tracking - don't let a logging
-    // failure ever break the actual dashboard load. Skipped entirely
-    // when opened from the admin panel's preview link (adminPreview
-    // query param), so Tyler checking on a customer doesn't get
-    // counted as real family engagement.
-    if (req.query.adminPreview !== '1') {
-      try {
-        await pool.query(
-          `INSERT INTO dashboard_views (missionary_email) VALUES ($1)`,
-          [missionaryEmail]
-        );
-      } catch (logErr) {
-        console.error('Error logging dashboard view:', logErr);
-      }
-    }
-
-    const emails = await pool.query(
-      `SELECT * FROM emails WHERE LOWER(from_address) LIKE '%' || $1 || '%' AND is_deleted = FALSE ORDER BY received_at DESC`,
-      [missionaryEmail]
-    );
-    const emailIds = emails.rows.map(e => e.id);
-    const attachments = emailIds.length
-      ? await pool.query(`SELECT * FROM attachments WHERE email_id = ANY($1) AND is_deleted = FALSE`, [emailIds])
-      : { rows: [] };
-
-    // Build each email "moment" with its attachments categorized and
-    // given a real, temporary viewable URL.
-    const moments = await Promise.all(
-      emails.rows.map(async (email) => {
-        const emailAttachments = attachments.rows.filter(a => a.email_id === email.id);
-
-        const withUrls = await Promise.all(
-          emailAttachments.map(async (a) => {
-            const url = await getSignedFileUrl(a.saved_as);
-            const ext = a.original_name.split('.').pop().toLowerCase();
-
-            let category = 'other';
-            if (a.mime_type.startsWith('image/')) category = 'photo';
-            else if (a.mime_type.startsWith('audio/')) category = 'audio';
-            else if (a.mime_type.startsWith('video/')) category = 'video';
-            // Fallback: some old records or unusual email clients send a
-            // generic mimetype - use the file extension as backup.
-            else if (['jpg','jpeg','png','heic','gif','webp'].includes(ext)) category = 'photo';
-            else if (['m4a','mp3','wav','aac','ogg'].includes(ext)) category = 'audio';
-            else if (['mp4','mov'].includes(ext)) category = 'video';
-
-            return { ...a, url, category };
-          })
-        );
-
-        return {
-          id: email.id,
-          subject: email.subject,
-          text: email.body_text,
-          receivedAt: email.received_at,
-          hasDriveLink: email.has_drive_link || false,
-          detectedIssueType: email.detected_issue_type || null,
-          isMostlyLink: email.is_mostly_link || false,
-          photos: withUrls.filter(a => a.category === 'photo'),
-          audio: withUrls.filter(a => a.category === 'audio'),
-          videos: withUrls.filter(a => a.category === 'video'),
-          other: withUrls.filter(a => a.category === 'other'),
-        };
-      })
-    );
-
-    res.json({
-      missionary,
-      totalMoments: moments.length,
-      totalPhotos: moments.reduce((sum, m) => sum + m.photos.length, 0),
-      totalAudio: moments.reduce((sum, m) => sum + m.audio.length, 0),
-      moments,
-    });
+    res.json(payload);
   } catch (err) {
     console.error('Error building dashboard data:', err);
+    res.status(500).json({ error: 'Error fetching dashboard data' });
+  }
+});
+
+// New, private way to reach a dashboard - a random token instead of
+// the missionary's real email address.
+app.get('/dashboard/by-token/:token', async (req, res) => {
+  try {
+    const tokenResult = await pool.query(
+      `SELECT missionary_email FROM missionaries WHERE dashboard_token = $1`,
+      [req.params.token]
+    );
+    const missionaryEmail = tokenResult.rows[0]?.missionary_email;
+    if (!missionaryEmail) {
+      return res.status(404).json({ error: 'This dashboard link is invalid.' });
+    }
+    const payload = await buildDashboardPayload(missionaryEmail.toLowerCase().trim(), { logView: req.query.adminPreview !== '1' });
+    if (payload.removed) {
+      return res.status(403).json({ error: 'This account is no longer active.' });
+    }
+    res.json(payload);
+  } catch (err) {
+    console.error('Error building dashboard data (by token):', err);
     res.status(500).json({ error: 'Error fetching dashboard data' });
   }
 });
@@ -606,7 +753,7 @@ app.get('/download/:missionaryEmail', async (req, res) => {
     const type = req.query.type || 'all'; // all | photos | emails
 
     const emails = await pool.query(
-      `SELECT * FROM emails WHERE LOWER(from_address) LIKE '%' || $1 || '%' ORDER BY received_at ASC`,
+      `SELECT * FROM emails WHERE sender_email = $1 ORDER BY received_at ASC`,
       [missionaryEmail]
     );
     const emailIds = emails.rows.map(e => e.id);
@@ -654,7 +801,7 @@ app.get('/archive/:missionaryEmail', async (req, res) => {
     const missionaryEmail = req.params.missionaryEmail.toLowerCase().trim();
 
     const emails = await pool.query(
-      `SELECT * FROM emails WHERE LOWER(from_address) LIKE '%' || $1 || '%' ORDER BY received_at DESC`,
+      `SELECT * FROM emails WHERE sender_email = $1 ORDER BY received_at DESC`,
       [missionaryEmail]
     );
     const emailIds = emails.rows.map(e => e.id);
@@ -674,8 +821,10 @@ app.get('/archive/:missionaryEmail', async (req, res) => {
   }
 });
 
-// Simple viewer endpoint so you can check what's been captured
-app.get('/archive', async (req, res) => {
+// Admin-only viewer endpoint so Tyler can check what's been captured
+// across every customer. Used to have no auth at all - anyone who
+// found this URL could read every family's private emails.
+app.get('/archive', requireAdminKey, async (req, res) => {
   try {
     const emails = await pool.query(`SELECT * FROM emails ORDER BY received_at DESC`);
     const attachments = await pool.query(`SELECT * FROM attachments`);
@@ -705,7 +854,7 @@ app.get('/founding-status', async (req, res) => {
   }
 });
 
-app.post('/signup', async (req, res) => {
+app.post('/signup', rateLimit({ windowMs: 15 * 60 * 1000, max: 8, message: 'Too many attempts. Please try again in a few minutes.' }), async (req, res) => {
   try {
     const { missionaryEmail, missionaryName, familyEmail, familyPhone, expectedReturnDate, missionStartDate, missionStatus, isPreorder } = req.body;
 
@@ -718,12 +867,13 @@ app.post('/signup', async (req, res) => {
       }
       const cleanFamilyEmail = familyEmail.toLowerCase().trim();
       const token = crypto.randomBytes(24).toString('hex');
+      const dashboardToken = crypto.randomBytes(24).toString('hex');
 
       const result = await pool.query(
-        `INSERT INTO missionaries (family_email, family_phone, mission_status, completion_token)
-         VALUES ($1, $2, 'preorder', $3)
+        `INSERT INTO missionaries (family_email, family_phone, mission_status, completion_token, dashboard_token)
+         VALUES ($1, $2, 'preorder', $3, $4)
          RETURNING *`,
-        [cleanFamilyEmail, familyPhone || null, token]
+        [cleanFamilyEmail, familyPhone || null, token, dashboardToken]
       );
 
       res.status(200).json(result.rows[0]);
@@ -755,12 +905,30 @@ app.post('/signup', async (req, res) => {
       return res.status(400).json({ error: 'Missionary email and family email are both required' });
     }
 
+    const cleanMissionaryEmailForCheck = missionaryEmail.toLowerCase().trim();
+
+    // Guard against hijacking an already-paid account: without this,
+    // anyone who knew (or guessed) a missionary's address could
+    // resubmit the signup form with their own family_email and the
+    // ON CONFLICT below would silently redirect that family's
+    // dashboard-recovery and onboarding emails to the attacker.
+    // Unpaid/incomplete rows can still be freely resubmitted (e.g.
+    // someone retrying after an abandoned checkout).
+    const existingMissionary = await pool.query(
+      `SELECT id, paid_amount FROM missionaries WHERE missionary_email = $1`,
+      [cleanMissionaryEmailForCheck]
+    );
+    if (existingMissionary.rows[0] && parseFloat(existingMissionary.rows[0].paid_amount || 0) > 0) {
+      return res.status(409).json({ error: 'This missionary already has an active account. If this is your family and you need help, please contact us.' });
+    }
+
     const result = await pool.query(
-      `INSERT INTO missionaries (missionary_email, missionary_name, family_email, family_phone, expected_return_date, mission_start_date, mission_status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO missionaries (missionary_email, missionary_name, family_email, family_phone, expected_return_date, mission_start_date, mission_status, dashboard_token)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        ON CONFLICT (missionary_email) DO UPDATE SET
          family_email = $3, missionary_name = $2, family_phone = $4, expected_return_date = $5,
-         mission_start_date = $6, mission_status = $7
+         mission_start_date = $6, mission_status = $7,
+         dashboard_token = COALESCE(missionaries.dashboard_token, $8)
        RETURNING *`,
       [
         missionaryEmail.toLowerCase().trim(),
@@ -769,7 +937,8 @@ app.post('/signup', async (req, res) => {
         familyPhone || null,
         expectedReturnDate || null,
         missionStartDate || null,
-        missionStatus || null
+        missionStatus || null,
+        crypto.randomBytes(24).toString('hex')
       ]
     );
 
@@ -782,13 +951,14 @@ app.post('/signup', async (req, res) => {
       res.status(200).json(m);
       await sendSignupEmails({
         missionaryEmail: m.missionary_email, missionaryName: m.missionary_name, familyEmail: m.family_email,
-        missionStartDate: m.mission_start_date, missionStatus: m.mission_status
+        missionStartDate: m.mission_start_date, missionStatus: m.mission_status, dashboardToken: m.dashboard_token
       });
       return;
     }
 
     const params = new URLSearchParams({ email: m.missionary_email });
     if (m.missionary_name) params.set('name', m.missionary_name);
+    if (m.dashboard_token) params.set('token', m.dashboard_token);
 
     const { currentPriceCents } = await getFoundingStatus();
 
@@ -854,13 +1024,14 @@ app.post('/signup/complete', async (req, res) => {
       res.status(200).json(row);
       await sendSignupEmails({
         missionaryEmail: row.missionary_email, missionaryName: row.missionary_name, familyEmail: row.family_email,
-        missionStartDate: row.mission_start_date, missionStatus: row.mission_status
+        missionStartDate: row.mission_start_date, missionStatus: row.mission_status, dashboardToken: row.dashboard_token
       });
       return;
     }
 
     const params = new URLSearchParams({ email: row.missionary_email });
     if (row.missionary_name) params.set('name', row.missionary_name);
+    if (row.dashboard_token) params.set('token', row.dashboard_token);
 
     const { currentPriceCents } = await getFoundingStatus();
 
@@ -908,10 +1079,15 @@ async function sendMissionaryEmail(to, subject, text, html, emailType, trackingT
   }
 }
 
-async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, missionStartDate, missionStatus, targets = ['family', 'missionary'] }) {
+async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, missionStartDate, missionStatus, dashboardToken, targets = ['family', 'missionary'] }) {
   const cleanMissionaryEmail = missionaryEmail.toLowerCase().trim();
   const cleanFamilyEmail = familyEmail.toLowerCase().trim();
-  const dashboardUrl = `https://getmissionbridge.com/dashboard.html?email=${encodeURIComponent(cleanMissionaryEmail)}`;
+  // Prefer the private token link (not guessable the way an email
+  // address is) - falls back to the email-based link only if a token
+  // somehow isn't set yet, so onboarding never breaks either way.
+  const dashboardUrl = dashboardToken
+    ? `https://getmissionbridge.com/dashboard.html?token=${encodeURIComponent(dashboardToken)}`
+    : `https://getmissionbridge.com/dashboard.html?email=${encodeURIComponent(cleanMissionaryEmail)}`;
   const guideUrl = 'https://getmissionbridge.com/photo-guide.html';
   const firstName = (missionaryName || '').trim().split(' ')[0];
 
@@ -983,7 +1159,7 @@ async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, 
       cleanMissionaryEmail,
       'Your family set this up to save your emails home',
       `Hi${firstName ? ' ' + firstName : ''},\n\n` +
-      `Your family signed up for Mission Bridge Archive, a free tool that automatically saves your emails, photos, and voice memos so nothing gets lost while you're serving.\n\n` +
+      `Your family signed up for Mission Bridge Archive, which automatically saves your emails, photos, and voice memos so nothing gets lost while you're serving. There's nothing for you to pay or set up beyond the one step below.\n\n` +
       `All you need to do: add this address to your regular email list, the same way you'd add anyone else you send your update to:\n\n` +
       `archive@parse.getmissionbridge.com\n\n` +
       `That's it for emails. Any time you email your update home with that address included, your message and anything you attach gets saved automatically. No app to download, nothing else to set up.\n\n` +
@@ -996,7 +1172,7 @@ async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, 
       `If you got this and everything makes sense, tap this link so we know it reached you: ${confirmUrl}\n\n` +
       `Questions? Your family can reach out to tyler@getmissionbridge.com anytime.`,
       `<p>Hi${firstName ? ' ' + firstName : ''},</p>` +
-      `<p>Your family signed up for Mission Bridge Archive, a free tool that automatically saves your emails, photos, and voice memos so nothing gets lost while you're serving.</p>` +
+      `<p>Your family signed up for Mission Bridge Archive, which automatically saves your emails, photos, and voice memos so nothing gets lost while you're serving. There's nothing for you to pay or set up beyond the one step below.</p>` +
       `<p><strong>All you need to do:</strong> add this address to your regular email list, the same way you'd add anyone else you send your update to:</p>` +
       `<p><code>archive@parse.getmissionbridge.com</code></p>` +
       `<p>That's it for emails. Any time you email your update home with that address included, your message and anything you attach gets saved automatically. No app to download, nothing else to set up.</p>` +
@@ -1021,7 +1197,7 @@ async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, 
 }
 
 // Waitlist signup endpoint - the landing page form will POST here
-app.post('/waitlist', async (req, res) => {
+app.post('/waitlist', rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: 'Too many attempts. Please try again in a few minutes.' }), async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) {
@@ -1040,8 +1216,9 @@ app.post('/waitlist', async (req, res) => {
   }
 });
 
-// Quick way to check waitlist signups
-app.get('/waitlist', async (req, res) => {
+// Quick way to check waitlist signups (admin-only - used to have no auth,
+// exposing everyone's email who joined the waitlist to anyone with the URL)
+app.get('/waitlist', requireAdminKey, async (req, res) => {
   try {
     const result = await pool.query(`SELECT * FROM waitlist ORDER BY joined_at DESC`);
     res.json(result.rows);
@@ -1050,6 +1227,29 @@ app.get('/waitlist', async (req, res) => {
     res.status(500).send('Error fetching waitlist');
   }
 });
+
+// Resolves which missionary a customer-facing request is acting on
+// behalf of, from either their email or their private dashboard token
+// (whichever the caller has). There's no real account/session system
+// here - this is the "proof of ownership" check for actions like
+// deleting an item, matched against the actual database record by the
+// caller, never just trusted at face value.
+async function resolveRequestedMissionaryEmail(req) {
+  const rawEmail = (req.query.missionaryEmail || req.body?.missionaryEmail || '').toLowerCase().trim();
+  if (rawEmail) return rawEmail;
+
+  const token = req.query.token || req.query.dashboardToken || req.body?.token;
+  if (token) {
+    const result = await pool.query(
+      `SELECT missionary_email FROM missionaries WHERE dashboard_token = $1`,
+      [token]
+    );
+    if (result.rows[0]?.missionary_email) {
+      return result.rows[0].missionary_email.toLowerCase().trim();
+    }
+  }
+  return null;
+}
 
 // Simple admin protection - requires a secret key in the request.
 // Not bank-grade security, but keeps random people from finding this.
@@ -1066,6 +1266,7 @@ app.get('/admin/overview', requireAdminKey, async (req, res) => {
   try {
     const missionaryCount = await pool.query(`SELECT COUNT(*) FROM missionaries WHERE is_removed = FALSE`);
     const totalRevenue = await pool.query(`SELECT COALESCE(SUM(paid_amount), 0) as total FROM missionaries`);
+    const paidCustomerCount = await pool.query(`SELECT COUNT(*) FROM missionaries WHERE paid_amount > 0`);
     const totalExpenditures = await pool.query(`SELECT COALESCE(SUM(amount), 0) as total FROM expenditures`);
     const totalAttachmentSize = await pool.query(`SELECT COALESCE(SUM(size_bytes), 0) as total FROM attachments WHERE is_deleted = FALSE`);
     const totalEmails = await pool.query(`SELECT COUNT(*) FROM emails WHERE is_deleted = FALSE`);
@@ -1084,11 +1285,22 @@ app.get('/admin/overview', requireAdminKey, async (req, res) => {
       dbHealthy = false;
     }
 
+    // Estimated, not exact - Stripe's real per-transaction fee isn't
+    // stored anywhere (would need pulling each charge's balance
+    // transaction from the Stripe API), so this approximates the
+    // standard 2.9% + $0.30 rate against actual paid transactions,
+    // just so "net profit" isn't quietly overstated.
+    const revenueTotal = parseFloat(totalRevenue.rows[0].total);
+    const paidCount = parseInt(paidCustomerCount.rows[0].count, 10);
+    const estimatedStripeFees = paidCount > 0 ? (revenueTotal * 0.029) + (paidCount * 0.30) : 0;
+
     res.json({
       totalCustomers: parseInt(missionaryCount.rows[0].count, 10),
-      totalRevenue: parseFloat(totalRevenue.rows[0].total),
+      totalRevenue: revenueTotal,
       totalExpenditures: parseFloat(totalExpenditures.rows[0].total),
-      netProfit: parseFloat(totalRevenue.rows[0].total) - parseFloat(totalExpenditures.rows[0].total),
+      netProfit: revenueTotal - parseFloat(totalExpenditures.rows[0].total),
+      estimatedStripeFees: parseFloat(estimatedStripeFees.toFixed(2)),
+      netProfitAfterFees: parseFloat((revenueTotal - parseFloat(totalExpenditures.rows[0].total) - estimatedStripeFees).toFixed(2)),
       totalEmailsCaptured: parseInt(totalEmails.rows[0].count, 10),
       waitlistSignups: parseInt(waitlistCount.rows[0].count, 10),
       storage: {
@@ -1117,7 +1329,7 @@ app.get('/admin/customers', requireAdminKey, async (req, res) => {
     const customers = await Promise.all(
       missionaries.rows.map(async (m) => {
         const emails = await pool.query(
-          `SELECT id FROM emails WHERE LOWER(from_address) LIKE '%' || $1 || '%'`,
+          `SELECT id FROM emails WHERE sender_email = $1`,
           [m.missionary_email]
         );
         const emailIds = emails.rows.map(e => e.id);
@@ -1218,6 +1430,7 @@ app.post('/admin/customers/:id/resend', requireAdminKey, async (req, res) => {
       familyEmail: m.family_email,
       missionStartDate: m.mission_start_date,
       missionStatus: m.mission_status,
+      dashboardToken: m.dashboard_token,
       targets
     });
   } catch (err) {
@@ -1313,7 +1526,7 @@ app.post('/admin/customers/:id/delete-forever', requireAdminKey, async (req, res
       const attachmentsResult = await pool.query(
         `SELECT a.saved_as FROM attachments a
          JOIN emails e ON a.email_id = e.id
-         WHERE LOWER(e.from_address) LIKE '%' || $1 || '%'`,
+         WHERE e.sender_email = $1`,
         [m.missionary_email]
       );
       for (const row of attachmentsResult.rows) {
@@ -1327,7 +1540,7 @@ app.post('/admin/customers/:id/delete-forever', requireAdminKey, async (req, res
       // Attachments cascade-delete automatically when their parent
       // email row is removed.
       await pool.query(
-        `DELETE FROM emails WHERE LOWER(from_address) LIKE '%' || $1 || '%'`,
+        `DELETE FROM emails WHERE sender_email = $1`,
         [m.missionary_email]
       );
       await pool.query(`DELETE FROM dashboard_views WHERE LOWER(missionary_email) = $1`, [m.missionary_email.toLowerCase()]);
@@ -1441,9 +1654,24 @@ app.get('/admin/detected-issues', requireAdminKey, async (req, res) => {
   }
 });
 
-// Customer-facing: soft-delete an individual email/update (and its attachments)
+// Customer-facing: soft-delete an individual email/update (and its attachments).
+// Requires proof of ownership (the missionary's email or their dashboard
+// token) matched against the actual record - previously this had no
+// check at all, meaning anyone who could guess a sequential ID could
+// delete any customer's data.
 app.delete('/dashboard/email/:emailId', async (req, res) => {
   try {
+    const owner = await resolveRequestedMissionaryEmail(req);
+    if (!owner) {
+      return res.status(400).json({ error: 'missionaryEmail or token is required' });
+    }
+    const check = await pool.query(
+      `SELECT id FROM emails WHERE id = $1 AND sender_email = $2`,
+      [req.params.emailId, owner]
+    );
+    if (check.rows.length === 0) {
+      return res.status(403).json({ error: 'Not authorized to delete this item' });
+    }
     await pool.query(`UPDATE emails SET is_deleted = TRUE WHERE id = $1`, [req.params.emailId]);
     await pool.query(`UPDATE attachments SET is_deleted = TRUE WHERE email_id = $1`, [req.params.emailId]);
     res.json({ success: true });
@@ -1453,9 +1681,21 @@ app.delete('/dashboard/email/:emailId', async (req, res) => {
   }
 });
 
-// Customer-facing: soft-delete a single attachment (e.g. just one photo)
+// Customer-facing: soft-delete a single attachment (e.g. just one photo).
+// Same ownership check as above, joined through to the parent email.
 app.delete('/dashboard/attachment/:attachmentId', async (req, res) => {
   try {
+    const owner = await resolveRequestedMissionaryEmail(req);
+    if (!owner) {
+      return res.status(400).json({ error: 'missionaryEmail or token is required' });
+    }
+    const check = await pool.query(
+      `SELECT a.id FROM attachments a JOIN emails e ON a.email_id = e.id WHERE a.id = $1 AND e.sender_email = $2`,
+      [req.params.attachmentId, owner]
+    );
+    if (check.rows.length === 0) {
+      return res.status(403).json({ error: 'Not authorized to delete this item' });
+    }
     await pool.query(`UPDATE attachments SET is_deleted = TRUE WHERE id = $1`, [req.params.attachmentId]);
     res.json({ success: true });
   } catch (err) {
@@ -1618,7 +1858,7 @@ async function checkAndSendNoUpdatesNudge() {
         AND m.mission_start_date <= CURRENT_DATE
         AND m.no_updates_nudge_count < 2
         AND NOT EXISTS (
-          SELECT 1 FROM emails e WHERE LOWER(e.from_address) LIKE '%' || m.missionary_email || '%'
+          SELECT 1 FROM emails e WHERE e.sender_email = LOWER(m.missionary_email)
         )
         AND (
           (m.last_no_updates_nudge_at IS NULL AND m.mission_start_date <= CURRENT_DATE - INTERVAL '10 days')
@@ -1673,7 +1913,7 @@ async function checkAndSendMissionaryNudge() {
         AND m.mission_start_date <= CURRENT_DATE
         AND m.missionary_nudge_count < 2
         AND NOT EXISTS (
-          SELECT 1 FROM emails e WHERE LOWER(e.from_address) LIKE '%' || m.missionary_email || '%'
+          SELECT 1 FROM emails e WHERE e.sender_email = LOWER(m.missionary_email)
         )
         AND (
           (m.last_missionary_nudge_at IS NULL AND m.mission_start_date <= CURRENT_DATE - INTERVAL '14 days')

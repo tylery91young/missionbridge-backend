@@ -1,4 +1,5 @@
 const { Pool } = require('pg');
+const crypto = require('crypto');
 
 // Render will give us a DATABASE_URL environment variable automatically
 // once we create a PostgreSQL database and link it to this service.
@@ -243,6 +244,41 @@ async function initDb() {
   await pool.query(`
     ALTER TABLE attachments ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE;
   `);
+
+  // The exact, parsed sender address (as opposed to from_address, which
+  // stores the raw "Name <email>" header). Queries used to match a
+  // missionary's emails via LIKE '%email%' against from_address, which
+  // meant one missionary's address being a substring of another's
+  // (e.g. smith@x.com inside johnsmith@x.com) could leak emails
+  // between accounts. This column lets every lookup use an exact
+  // match instead.
+  await pool.query(`
+    ALTER TABLE emails ADD COLUMN IF NOT EXISTS sender_email TEXT;
+  `);
+  // Backfill existing rows using the same parsing logic the inbound
+  // webhook uses at insert time. Safe to run every boot - only
+  // touches rows that don't have it yet.
+  await pool.query(`
+    UPDATE emails
+    SET sender_email = LOWER(TRIM(COALESCE(substring(from_address from '<([^>]+)>'), from_address)))
+    WHERE sender_email IS NULL;
+  `);
+
+  // A private, unguessable dashboard identifier so links don't have to
+  // be the missionary's actual email address (which is guessable by
+  // anyone the missionary has ever given it to). New signups get one
+  // immediately; existing rows are backfilled below. The old
+  // email-based dashboard route keeps working for links already sent.
+  await pool.query(`
+    ALTER TABLE missionaries ADD COLUMN IF NOT EXISTS dashboard_token TEXT UNIQUE;
+  `);
+  const needsDashboardToken = await pool.query(
+    `SELECT id FROM missionaries WHERE dashboard_token IS NULL`
+  );
+  for (const row of needsDashboardToken.rows) {
+    const token = crypto.randomBytes(24).toString('hex');
+    await pool.query(`UPDATE missionaries SET dashboard_token = $1 WHERE id = $2`, [token, row.id]);
+  }
 
   console.log('Database tables ready.');
 }
