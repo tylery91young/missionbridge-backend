@@ -1097,6 +1097,11 @@ app.post('/signup', rateLimit({ windowMs: 15 * 60 * 1000, max: 8, message: 'Too 
         quantity: 1,
       }],
       allow_promotion_codes: true,
+      custom_text: {
+        submit: {
+          message: `We know $${(currentPriceCents / 100).toFixed(0)} can be a real stretch for missionary families. That's part of why there's a referral program waiting in your welcome email after this - share your code, and it can end up paying for itself, or more.`,
+        },
+      },
       metadata: { missionaryId: String(m.id), isNewSignup: 'true' },
       success_url: `https://getmissionbridge.com/welcome.html?${params.toString()}`,
       cancel_url: 'https://getmissionbridge.com/',
@@ -1171,6 +1176,11 @@ app.post('/signup/complete', async (req, res) => {
         quantity: 1,
       }],
       allow_promotion_codes: true,
+      custom_text: {
+        submit: {
+          message: `We know $${(currentPriceCents / 100).toFixed(0)} can be a real stretch for missionary families. That's part of why there's a referral program waiting in your welcome email after this - share your code, and it can end up paying for itself, or more.`,
+        },
+      },
       metadata: { missionaryId: String(row.id), isNewSignup: 'true' },
       success_url: `https://getmissionbridge.com/welcome.html?${params.toString()}`,
       cancel_url: 'https://getmissionbridge.com/',
