@@ -97,6 +97,105 @@ function resolveMimeType(originalMimeType, filename) {
   return knownTypes[ext] || originalMimeType || 'application/octet-stream';
 }
 
+// ---- Operation Wildfire: referral program ----
+// Each paying customer gets a personal code (their last name, deduped
+// on collision) tied to a real Stripe Promotion Code, so anyone who
+// uses it gets $10 off and the code's owner earns $10 when they do.
+// Everything here is best-effort and wrapped by the caller - a
+// failure to create a referral code should never block a real
+// payment or the onboarding emails that follow it.
+
+let referralCouponIdCache = null;
+// The $10-off coupon is shared across every customer's personal code -
+// Stripe lets many Promotion Codes point at one Coupon. Created once,
+// lazily, then reused.
+async function getOrCreateReferralCoupon() {
+  if (referralCouponIdCache) return referralCouponIdCache;
+  const existing = await stripe.coupons.list({ limit: 100 });
+  const found = existing.data.find(c => c.metadata?.purpose === 'referral_program');
+  if (found) {
+    referralCouponIdCache = found.id;
+    return found.id;
+  }
+  const coupon = await stripe.coupons.create({
+    amount_off: 1000,
+    currency: 'usd',
+    duration: 'once',
+    name: 'Referral - $10 off',
+    metadata: { purpose: 'referral_program' },
+  });
+  referralCouponIdCache = coupon.id;
+  return coupon.id;
+}
+
+function sanitizeReferralCodeBase(missionaryName, familyEmail) {
+  const lastName = (missionaryName || '').trim().split(/\s+/).pop() || '';
+  const base = lastName || (familyEmail || '').split('@')[0] || 'FRIEND';
+  const cleaned = base.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  return cleaned || 'FRIEND';
+}
+
+// Generates this missionary's own referral code (if they don't have
+// one yet) and a real Stripe Promotion Code behind it. Only called
+// after payment confirms. Safe to call again for someone who already
+// has a code - it's a no-op.
+async function ensureReferralCode(missionary) {
+  if (!stripe || missionary.referral_code) return missionary.referral_code || null;
+
+  const base = sanitizeReferralCodeBase(missionary.missionary_name, missionary.family_email);
+  const couponId = await getOrCreateReferralCoupon();
+
+  let code = base;
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const candidate = attempt === 0 ? base : `${base}${attempt + 1}`;
+    const clash = await pool.query(`SELECT id FROM missionaries WHERE referral_code = $1`, [candidate]);
+    if (clash.rows.length === 0) {
+      code = candidate;
+      break;
+    }
+  }
+
+  await stripe.promotionCodes.create({
+    coupon: couponId,
+    code,
+    metadata: { referrerMissionaryId: String(missionary.id) },
+  });
+
+  await pool.query(`UPDATE missionaries SET referral_code = $1 WHERE id = $2`, [code, missionary.id]);
+  return code;
+}
+
+// Checks whether a completed Stripe Checkout Session used a referral
+// promotion code, and if so, credits $10 to whichever of our
+// customers owns that code. Never credits someone for referring
+// themselves (structurally shouldn't happen, since a code doesn't
+// exist until after its owner has already paid, but checked anyway).
+async function recordReferralIfUsed(sessionId, newMissionaryId) {
+  if (!stripe) return;
+  try {
+    const fullSession = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ['discounts.promotion_code'],
+    });
+    const usedCode = fullSession.discounts?.[0]?.promotion_code?.code;
+    if (!usedCode) return;
+
+    const ownerResult = await pool.query(
+      `SELECT id FROM missionaries WHERE referral_code = $1`,
+      [usedCode]
+    );
+    const ownerId = ownerResult.rows[0]?.id;
+    if (!ownerId || ownerId === newMissionaryId) return;
+
+    await pool.query(
+      `INSERT INTO referral_credits (owner_missionary_id, referred_missionary_id, amount) VALUES ($1, $2, 10)`,
+      [ownerId, newMissionaryId]
+    );
+    console.log(`Referral credit: missionary #${ownerId} earned $10 for referring missionary #${newMissionaryId}`);
+  } catch (err) {
+    console.error('Error checking/recording referral credit:', err.message);
+  }
+}
+
 // Stripe requires the raw, unparsed request body to verify a webhook's
 // signature - this MUST be defined before app.use(express.json()) below,
 // since that would otherwise parse the body first and break verification.
@@ -128,6 +227,25 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
         );
         console.log(`Payment confirmed via Stripe: $${amountPaid} for missionary #${missionaryId}`);
 
+        let referralCode = null;
+        if (result.rows[0]) {
+          const m = result.rows[0];
+          // Every real paying customer gets their own referral code
+          // going forward, and this checkout itself might have used
+          // someone else's - both best-effort, never block payment
+          // confirmation or onboarding on either.
+          try {
+            await recordReferralIfUsed(session.id, m.id);
+          } catch (refErr) {
+            console.error(`Error recording referral for missionary #${missionaryId}:`, refErr.message);
+          }
+          try {
+            referralCode = await ensureReferralCode(m);
+          } catch (codeErr) {
+            console.error(`Error creating referral code for missionary #${missionaryId}:`, codeErr.message);
+          }
+        }
+
         // For a brand-new signup (not an existing free customer being
         // asked to pay via the admin payment-link tool), onboarding
         // emails only go out now, once payment is actually confirmed -
@@ -143,7 +261,8 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
               familyEmail: m.family_email,
               missionStartDate: m.mission_start_date,
               missionStatus: m.mission_status,
-              dashboardToken: m.dashboard_token
+              dashboardToken: m.dashboard_token,
+              referralCode
             });
             console.log(`Sent onboarding emails after confirmed payment for missionary #${missionaryId}`);
           } catch (mailErr) {
@@ -977,6 +1096,7 @@ app.post('/signup', rateLimit({ windowMs: 15 * 60 * 1000, max: 8, message: 'Too 
         },
         quantity: 1,
       }],
+      allow_promotion_codes: true,
       metadata: { missionaryId: String(m.id), isNewSignup: 'true' },
       success_url: `https://getmissionbridge.com/welcome.html?${params.toString()}`,
       cancel_url: 'https://getmissionbridge.com/',
@@ -1050,6 +1170,7 @@ app.post('/signup/complete', async (req, res) => {
         },
         quantity: 1,
       }],
+      allow_promotion_codes: true,
       metadata: { missionaryId: String(row.id), isNewSignup: 'true' },
       success_url: `https://getmissionbridge.com/welcome.html?${params.toString()}`,
       cancel_url: 'https://getmissionbridge.com/',
@@ -1079,7 +1200,7 @@ async function sendMissionaryEmail(to, subject, text, html, emailType, trackingT
   }
 }
 
-async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, missionStartDate, missionStatus, dashboardToken, targets = ['family', 'missionary'] }) {
+async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, missionStartDate, missionStatus, dashboardToken, referralCode, targets = ['family', 'missionary'] }) {
   const cleanMissionaryEmail = missionaryEmail.toLowerCase().trim();
   const cleanFamilyEmail = familyEmail.toLowerCase().trim();
   // Prefer the private token link (not guessable the way an email
@@ -1102,6 +1223,16 @@ async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, 
     ? `<p><strong>One more thing,</strong> since they're already out serving: when you set up Partner Sharing in the guide above, make sure it's set to share <strong>all photos</strong>, not just "since a specific date" - otherwise anything from before today never gets backed up.</p>`
     : '';
 
+  // Operation Wildfire: only included if a code actually got created
+  // (best-effort, so a Stripe hiccup here should never hold up the
+  // rest of onboarding).
+  const referralNote = referralCode
+    ? `\n\nOne more thing: you've got your own referral code — ${referralCode}. Share it with other missionary families you know. Anyone who uses it at signup gets $10 off, and you earn $10 every time someone does — enough referrals and this pays for itself, then starts paying you. We send payouts via PayPal once you've earned some.`
+    : '';
+  const referralNoteHtml = referralCode
+    ? `<p><strong>One more thing:</strong> you've got your own referral code — <strong>${referralCode}</strong>. Share it with other missionary families you know. Anyone who uses it at signup gets $10 off, and you earn $10 every time someone does — enough referrals and this pays for itself, then starts paying you. We send payouts via PayPal once you've earned some.</p>`
+    : '';
+
   // 1. Welcome email to the family, with the actual instructions -
   // not just a friendly note. This is the thing they'll still have
   // in their inbox after they close the signup tab.
@@ -1118,7 +1249,7 @@ async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, 
       `2. Your dashboard: ${dashboardUrl}\n` +
       `Save this link somewhere you'll remember, like your bookmarks bar or a note on your phone. There's no password. This exact link is the only way anyone sees your missionary's dashboard, so keep it private and only share it with people you trust.\n\n` +
       `3. Set up Google Photos Partner Sharing too: ${guideUrl}\n` +
-      `Mission Bridge Archive saves everything they email home, but their phone holds a lot more photos than they'll ever email. Partner Sharing is the most foolproof way to catch everything else, and it's much easier to set up now than to fix it after the fact.${midMissionNote}\n\n` +
+      `Mission Bridge Archive saves everything they email home, but their phone holds a lot more photos than they'll ever email. Partner Sharing is the most foolproof way to catch everything else, and it's much easier to set up now than to fix it after the fact.${midMissionNote}${referralNote}\n\n` +
       `4. If anything looks off, an update doesn't show up, or you just have a question, email me anytime at tyler@getmissionbridge.com. I'd genuinely rather hear from you than have you wonder.\n\n` +
       `I built this because I wanted families to have one less thing to worry about during a mission. I hope it gives you some peace of mind.`,
       `<p>Hi! I'm Tyler, the person behind Mission Bridge Archive.</p>` +
@@ -1135,6 +1266,7 @@ async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, 
       `<a href="${guideUrl}">${guideUrl}</a><br>` +
       `Mission Bridge Archive saves everything they email home, but their phone holds a lot more photos than they'll ever email. Partner Sharing is the most foolproof way to catch everything else, and it's much easier to set up now than to fix it after the fact.</p>` +
       midMissionNoteHtml +
+      referralNoteHtml +
       `<p><strong>4. If anything looks off,</strong> an update doesn't show up, or you just have a question, email me anytime at <a href="mailto:tyler@getmissionbridge.com">tyler@getmissionbridge.com</a>. I'd genuinely rather hear from you than have you wonder.</p>` +
       `<p>I built this because I wanted families to have one less thing to worry about during a mission. I hope it gives you some peace of mind.</p>`,
       'welcome'
@@ -1651,6 +1783,44 @@ app.get('/admin/detected-issues', requireAdminKey, async (req, res) => {
   } catch (err) {
     console.error('Error fetching detected issues:', err);
     res.status(500).json({ error: 'Error fetching detected issues' });
+  }
+});
+
+// Operation Wildfire admin view: who's owed a referral payout, and
+// how much. Payout itself stays manual (PayPal) - this just makes it
+// visible instead of requiring a database query to check.
+app.get('/admin/referrals', requireAdminKey, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        rc.id, rc.amount, rc.paid_out, rc.created_at,
+        owner.id as owner_id, owner.missionary_name as owner_name, owner.family_email as owner_family_email, owner.referral_code,
+        referred.missionary_name as referred_name
+      FROM referral_credits rc
+      JOIN missionaries owner ON rc.owner_missionary_id = owner.id
+      JOIN missionaries referred ON rc.referred_missionary_id = referred.id
+      ORDER BY rc.created_at DESC
+    `);
+    const totalOwed = await pool.query(
+      `SELECT COALESCE(SUM(amount), 0) as total FROM referral_credits WHERE paid_out = FALSE`
+    );
+    res.json({
+      credits: result.rows,
+      totalOwed: parseFloat(totalOwed.rows[0].total),
+    });
+  } catch (err) {
+    console.error('Error fetching referral credits:', err);
+    res.status(500).json({ error: 'Error fetching referral credits' });
+  }
+});
+
+app.post('/admin/referrals/:id/mark-paid', requireAdminKey, async (req, res) => {
+  try {
+    await pool.query(`UPDATE referral_credits SET paid_out = TRUE WHERE id = $1`, [req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error marking referral credit paid:', err);
+    res.status(500).json({ error: 'Error marking referral credit paid' });
   }
 });
 

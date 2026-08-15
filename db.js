@@ -280,6 +280,28 @@ async function initDb() {
     await pool.query(`UPDATE missionaries SET dashboard_token = $1 WHERE id = $2`, [token, row.id]);
   }
 
+  // Operation Wildfire: each paying customer gets a personal referral
+  // code (their last name, deduped) tied to a real Stripe Promotion
+  // Code. Only generated after payment confirms (see server.js), so
+  // this column just needs to exist - nothing to backfill here.
+  await pool.query(`
+    ALTER TABLE missionaries ADD COLUMN IF NOT EXISTS referral_code TEXT UNIQUE;
+  `);
+
+  // Tracks each $10 earned when someone signs up using another
+  // customer's referral code. Payout stays manual (PayPal) at this
+  // scale - paid_out just lets the admin panel show what's still owed.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS referral_credits (
+      id SERIAL PRIMARY KEY,
+      owner_missionary_id INTEGER REFERENCES missionaries(id) ON DELETE CASCADE,
+      referred_missionary_id INTEGER REFERENCES missionaries(id) ON DELETE CASCADE,
+      amount NUMERIC NOT NULL DEFAULT 10,
+      paid_out BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
   console.log('Database tables ready.');
 }
 
