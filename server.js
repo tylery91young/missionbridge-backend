@@ -196,6 +196,130 @@ async function recordReferralIfUsed(sessionId, newMissionaryId) {
   }
 }
 
+// ---- System health checks ----
+// Checks every real external dependency this app actually relies on,
+// not just "is the database reachable." Used by both the admin
+// panel's live view and the periodic alert check below, so there's
+// exactly one definition of "healthy" instead of two that could drift
+// apart.
+async function runSystemHealthChecks() {
+  const checks = {};
+
+  try {
+    await pool.query('SELECT 1');
+    checks.database = { ok: true, label: 'Database' };
+  } catch (err) {
+    checks.database = { ok: false, label: 'Database', detail: err.message };
+  }
+
+  if (stripe) {
+    try {
+      await stripe.balance.retrieve();
+      checks.stripe = { ok: true, label: 'Stripe' };
+    } catch (err) {
+      checks.stripe = { ok: false, label: 'Stripe', detail: err.message };
+    }
+  } else {
+    checks.stripe = { ok: false, label: 'Stripe', detail: 'Not configured (missing STRIPE_SECRET_KEY)' };
+  }
+
+  if (process.env.R2_BUCKET_NAME) {
+    try {
+      await r2.send(new ListObjectsV2Command({ Bucket: process.env.R2_BUCKET_NAME, MaxKeys: 1 }));
+      checks.storage = { ok: true, label: 'File storage (R2)' };
+    } catch (err) {
+      checks.storage = { ok: false, label: 'File storage (R2)', detail: err.message };
+    }
+  } else {
+    checks.storage = { ok: false, label: 'File storage (R2)', detail: 'Not configured (missing R2_BUCKET_NAME)' };
+  }
+
+  checks.emailConfigured = process.env.SENDGRID_API_KEY
+    ? { ok: true, label: 'Email sending (SendGrid)' }
+    : { ok: false, label: 'Email sending (SendGrid)', detail: 'Not configured (missing SENDGRID_API_KEY)' };
+
+  // Real delivery signal, not just "is the key present" - catches
+  // things like the missionary-account SendGrid rejection this
+  // already ran into once for real (see mailer.js). Only flags a
+  // problem when there's meaningful volume and most of it is failing,
+  // so one bounced email out of one send doesn't cry wolf.
+  try {
+    const recent = await pool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE success = FALSE OR delivery_status IN ('bounce','dropped','blocked')) as failures,
+        COUNT(*) as total
+      FROM email_log WHERE sent_at > NOW() - INTERVAL '24 hours'
+    `);
+    const failures = parseInt(recent.rows[0].failures, 10);
+    const total = parseInt(recent.rows[0].total, 10);
+    const failing = total >= 3 && (failures / total) > 0.5;
+    checks.emailDelivery = {
+      ok: !failing,
+      label: 'Email delivery (last 24h)',
+      detail: `${failures}/${total} failed`,
+    };
+  } catch (err) {
+    checks.emailDelivery = { ok: false, label: 'Email delivery (last 24h)', detail: err.message };
+  }
+
+  const allOk = Object.values(checks).every(c => c.ok);
+  return { allOk, checks, checkedAt: new Date().toISOString() };
+}
+
+// Sends to Tyler directly (not logged as a customer-facing email
+// type) - tries SendGrid first, falls back to the Gmail relay if that
+// fails, same resilience pattern already used for missionary emails,
+// so a single provider outage doesn't also take out the alert telling
+// him about it.
+async function alertTyler(subject, text) {
+  const to = 'tyleryoung1796@gmail.com';
+  const html = `<p>${text.replace(/\n/g, '<br>')}</p>`;
+  try {
+    await sendEmail(to, subject, text, html, 'system_alert');
+  } catch (sgErr) {
+    console.error('Alert email via SendGrid failed, trying Gmail relay:', sgErr.message);
+    try {
+      await sendEmailViaGmail(to, subject, text, html, 'system_alert');
+    } catch (gmailErr) {
+      console.error('Alert email via Gmail relay ALSO failed - Tyler was not notified:', gmailErr.message);
+    }
+  }
+}
+
+// Runs on a timer (see the bottom of this file). Only emails on a
+// state *change* - the moment something breaks, and the moment
+// everything's healthy again - not on every single check while a
+// known problem is still being worked on, so this doesn't spam an
+// inbox with the same failure every 15 minutes.
+let lastSystemHealthOk = true;
+async function checkSystemHealthAndAlert() {
+  try {
+    const { allOk, checks } = await runSystemHealthChecks();
+
+    if (!allOk && lastSystemHealthOk) {
+      const problems = Object.values(checks)
+        .filter(c => !c.ok)
+        .map(c => `- ${c.label}: ${c.detail || 'failing'}`)
+        .join('\n');
+      await alertTyler(
+        'Mission Bridge Archive: system health problem detected',
+        `One or more systems just failed a health check:\n\n${problems}\n\nCheck the admin panel for full details.`
+      );
+      console.log('System health alert sent:', problems);
+    } else if (allOk && !lastSystemHealthOk) {
+      await alertTyler(
+        'Mission Bridge Archive: systems back to normal',
+        `Everything passed the health check again as of ${new Date().toLocaleString()}.`
+      );
+      console.log('System health recovery notice sent.');
+    }
+
+    lastSystemHealthOk = allOk;
+  } catch (err) {
+    console.error('Error running system health check:', err);
+  }
+}
+
 // Stripe requires the raw, unparsed request body to verify a webhook's
 // signature - this MUST be defined before app.use(express.json()) below,
 // since that would otherwise parse the body first and break verification.
@@ -862,7 +986,7 @@ app.post('/dashboard/:missionaryEmail/permissions', async (req, res) => {
 });
 
 const archiver = require('archiver');
-const { GetObjectCommand } = require('@aws-sdk/client-s3');
+const { GetObjectCommand, ListObjectsV2Command } = require('@aws-sdk/client-s3');
 
 // Download everything (or just photos, or just emails) as a zip file.
 // Usage: /download/:missionaryEmail?type=all|photos|emails
@@ -1419,13 +1543,7 @@ app.get('/admin/overview', requireAdminKey, async (req, res) => {
     const freeLimitGB = 10; // Cloudflare R2 free tier
     const percentOfFreeUsed = ((storageBytes / (1024 ** 3)) / freeLimitGB * 100).toFixed(2);
 
-    // Quick health checks
-    let dbHealthy = true;
-    try {
-      await pool.query('SELECT 1');
-    } catch {
-      dbHealthy = false;
-    }
+    const health = await runSystemHealthChecks();
 
     // Estimated, not exact - Stripe's real per-transaction fee isn't
     // stored anywhere (would need pulling each charge's balance
@@ -1452,9 +1570,9 @@ app.get('/admin/overview', requireAdminKey, async (req, res) => {
         percentOfFreeUsed: parseFloat(percentOfFreeUsed),
       },
       systemHealth: {
-        database: dbHealthy ? 'ok' : 'error',
-        server: 'ok',
-        checkedAt: new Date().toISOString(),
+        allOk: health.allOk,
+        checks: health.checks,
+        checkedAt: health.checkedAt,
       },
     });
   } catch (err) {
@@ -2202,6 +2320,8 @@ initDb()
     setInterval(checkAndSendMissionaryNudge, 24 * 60 * 60 * 1000);
     setTimeout(checkAndSendPreorderNudge, 90 * 1000);
     setInterval(checkAndSendPreorderNudge, 24 * 60 * 60 * 1000);
+    setTimeout(checkSystemHealthAndAlert, 20 * 1000);
+    setInterval(checkSystemHealthAndAlert, 15 * 60 * 1000);
   })
   .catch(err => {
     console.error('Failed to initialize database:', err);
