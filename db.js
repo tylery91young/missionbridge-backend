@@ -302,6 +302,25 @@ async function initDb() {
     );
   `);
 
+  // First-party site analytics - our own database only, nothing sent
+  // to a third party, no cross-site cookies. Just which of our own
+  // pages get visited and where traffic came from, so Tyler can see
+  // what's actually working. Not the same thing as the "ad tracking"
+  // the security page explicitly promises we don't do.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS page_views (
+      id SERIAL PRIMARY KEY,
+      path TEXT NOT NULL,
+      referrer TEXT,
+      utm_source TEXT,
+      utm_medium TEXT,
+      utm_campaign TEXT,
+      visitor_id TEXT,
+      user_agent TEXT,
+      viewed_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
   console.log('Database tables ready.');
 }
 

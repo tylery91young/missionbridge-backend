@@ -734,6 +734,35 @@ app.get('/track/confirm/:token', async (req, res) => {
     </head><body><div><h2>Thanks, you're all set!</h2><p>Nothing else to do on your end.</p></div></body></html>`);
 });
 
+// First-party page-view tracking, fired by a small inline script on
+// each public page. Deliberately never sent to a third party (see the
+// comment on the page_views table in db.js) - just our own database,
+// so this doesn't conflict with the "no ad tracking" promise on the
+// security page. Loosely rate-limited since it's just anonymous
+// analytics, not anything sensitive - the limit exists to stop spam
+// inflating the numbers, not to gate legitimate use.
+app.post('/track/pageview', rateLimit({ windowMs: 15 * 60 * 1000, max: 120, message: 'Too many requests.' }), async (req, res) => {
+  try {
+    const { path, referrer, utmSource, utmMedium, utmCampaign, visitorId } = req.body || {};
+    await pool.query(
+      `INSERT INTO page_views (path, referrer, utm_source, utm_medium, utm_campaign, visitor_id, user_agent)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        (path || '').slice(0, 500),
+        (referrer || '').slice(0, 500) || null,
+        utmSource ? String(utmSource).slice(0, 200) : null,
+        utmMedium ? String(utmMedium).slice(0, 200) : null,
+        utmCampaign ? String(utmCampaign).slice(0, 200) : null,
+        visitorId ? String(visitorId).slice(0, 100) : null,
+        (req.headers['user-agent'] || '').slice(0, 500) || null,
+      ]
+    );
+    res.status(204).end();
+  } catch (err) {
+    console.error('Error logging page view:', err.message);
+    res.status(204).end(); // never let a tracking failure look like a real error to the page
+  }
+});
 
 // For security, we email the link rather than displaying it directly,
 // so only someone with real access to that inbox can get in.
@@ -1892,6 +1921,56 @@ app.get('/admin/dashboard-activity', requireAdminKey, async (req, res) => {
   } catch (err) {
     console.error('Error fetching dashboard activity:', err);
     res.status(500).json({ error: 'Error fetching dashboard activity' });
+  }
+});
+
+// Admin: site traffic - which pages get visited, where people came
+// from, and unique visitors per day. Backed by the first-party
+// page_views table (see /track/pageview above and db.js).
+app.get('/admin/analytics', requireAdminKey, async (req, res) => {
+  try {
+    const days = String(Math.max(1, Math.min(365, parseInt(req.query.days, 10) || 30)));
+
+    const totals = await pool.query(
+      `SELECT COUNT(*) as views, COUNT(DISTINCT visitor_id) as unique_visitors
+       FROM page_views WHERE viewed_at > NOW() - ($1 || ' days')::interval`,
+      [days]
+    );
+
+    const byPage = await pool.query(
+      `SELECT path, COUNT(*) as views, COUNT(DISTINCT visitor_id) as unique_visitors
+       FROM page_views WHERE viewed_at > NOW() - ($1 || ' days')::interval
+       GROUP BY path ORDER BY views DESC LIMIT 25`,
+      [days]
+    );
+
+    const bySource = await pool.query(
+      `SELECT
+         COALESCE(NULLIF(utm_source, ''), NULLIF(referrer, ''), 'Direct') as source,
+         COUNT(*) as views
+       FROM page_views WHERE viewed_at > NOW() - ($1 || ' days')::interval
+       GROUP BY source ORDER BY views DESC LIMIT 25`,
+      [days]
+    );
+
+    const byDay = await pool.query(
+      `SELECT DATE(viewed_at) as day, COUNT(*) as views, COUNT(DISTINCT visitor_id) as unique_visitors
+       FROM page_views WHERE viewed_at > NOW() - ($1 || ' days')::interval
+       GROUP BY day ORDER BY day DESC`,
+      [days]
+    );
+
+    res.json({
+      days: parseInt(days, 10),
+      totalViews: parseInt(totals.rows[0].views, 10),
+      uniqueVisitors: parseInt(totals.rows[0].unique_visitors, 10),
+      byPage: byPage.rows,
+      bySource: bySource.rows,
+      byDay: byDay.rows,
+    });
+  } catch (err) {
+    console.error('Error fetching analytics:', err);
+    res.status(500).json({ error: 'Error fetching analytics' });
   }
 });
 
