@@ -321,6 +321,22 @@ async function initDb() {
     );
   `);
 
+  // Business to-do list, shown on the admin panel - separate from
+  // ROADMAP.md (the narrative build log). Both Tyler (via the admin UI)
+  // and Claude (via the same admin API, during conversations) can add
+  // to this, so it's a living list rather than something only edited
+  // by hand.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS business_todos (
+      id SERIAL PRIMARY KEY,
+      text TEXT NOT NULL,
+      is_done BOOLEAN DEFAULT FALSE,
+      created_by TEXT DEFAULT 'tyler',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      completed_at TIMESTAMPTZ
+    );
+  `);
+
   console.log('Database tables ready.');
 }
 

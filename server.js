@@ -2031,6 +2031,153 @@ app.post('/admin/referrals/:id/mark-paid', requireAdminKey, async (req, res) => 
   }
 });
 
+// ---- Business to-do list ----
+// A living task list for the business itself (follow-ups, ideas,
+// things to fix) - separate from ROADMAP.md, the narrative build log.
+// Both Tyler (via the admin UI) and Claude (via this same API, during
+// conversations, given the admin key) can add to it.
+app.get('/admin/todos', requireAdminKey, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM business_todos ORDER BY is_done ASC, created_at DESC`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching todos:', err);
+    res.status(500).json({ error: 'Error fetching todos' });
+  }
+});
+
+app.post('/admin/todos', requireAdminKey, async (req, res) => {
+  try {
+    const { text, createdBy } = req.body;
+    if (!text || !text.trim()) {
+      return res.status(400).json({ error: 'Text is required' });
+    }
+    const result = await pool.query(
+      `INSERT INTO business_todos (text, created_by) VALUES ($1, $2) RETURNING *`,
+      [text.trim(), createdBy === 'claude' ? 'claude' : 'tyler']
+    );
+    res.status(200).json(result.rows[0]);
+  } catch (err) {
+    console.error('Error adding todo:', err);
+    res.status(500).json({ error: 'Error adding todo' });
+  }
+});
+
+app.post('/admin/todos/:id/toggle', requireAdminKey, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE business_todos
+       SET is_done = NOT is_done, completed_at = CASE WHEN is_done THEN NULL ELSE NOW() END
+       WHERE id = $1 RETURNING *`,
+      [req.params.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'To-do not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error toggling todo:', err);
+    res.status(500).json({ error: 'Error updating todo' });
+  }
+});
+
+app.delete('/admin/todos/:id', requireAdminKey, async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM business_todos WHERE id = $1`, [req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error deleting todo:', err);
+    res.status(500).json({ error: 'Error deleting todo' });
+  }
+});
+
+// Admin: manually create a customer record directly, bypassing Stripe
+// entirely - for comped/free accounts or a custom reduced price Tyler
+// arranges personally (e.g. a ward member, a founding tester). Unlike
+// the public /signup form, paid_amount is set directly here since
+// there may be no Stripe charge at all. Still runs through the same
+// hijack guard, dashboard-token generation, referral-code generation,
+// and onboarding-email path a real Stripe signup gets, so a comped
+// customer isn't a second-class experience.
+app.post('/admin/customers/manual', requireAdminKey, async (req, res) => {
+  try {
+    const {
+      missionaryName, missionaryEmail, familyEmail, familyPhone,
+      expectedReturnDate, missionStartDate, missionStatus,
+      paidAmount, notes, sendEmails,
+    } = req.body;
+
+    if (!missionaryEmail || !familyEmail) {
+      return res.status(400).json({ error: 'Missionary email and family email are both required' });
+    }
+
+    const cleanMissionaryEmail = missionaryEmail.toLowerCase().trim();
+    const cleanFamilyEmail = familyEmail.toLowerCase().trim();
+
+    const existing = await pool.query(
+      `SELECT id, paid_amount FROM missionaries WHERE missionary_email = $1`,
+      [cleanMissionaryEmail]
+    );
+    if (existing.rows[0] && parseFloat(existing.rows[0].paid_amount || 0) > 0) {
+      return res.status(409).json({ error: 'This missionary already has an active account.' });
+    }
+
+    const dashboardToken = crypto.randomBytes(24).toString('hex');
+    const amount = (paidAmount !== undefined && paidAmount !== null && paidAmount !== '') ? parseFloat(paidAmount) : 0;
+    const combinedNotes = [notes && notes.trim(), 'Manually added by admin'].filter(Boolean).join(' — ');
+
+    const result = await pool.query(
+      `INSERT INTO missionaries (missionary_email, missionary_name, family_email, family_phone, expected_return_date, mission_start_date, mission_status, paid_amount, notes, dashboard_token)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (missionary_email) DO UPDATE SET
+         family_email = $3, missionary_name = $2, family_phone = $4, expected_return_date = $5,
+         mission_start_date = $6, mission_status = $7, paid_amount = $8, notes = $9,
+         dashboard_token = COALESCE(missionaries.dashboard_token, $10)
+       RETURNING *`,
+      [
+        cleanMissionaryEmail, missionaryName || null, cleanFamilyEmail, familyPhone || null,
+        expectedReturnDate || null, missionStartDate || null, missionStatus || 'serving',
+        amount, combinedNotes, dashboardToken,
+      ]
+    );
+
+    const m = result.rows[0];
+
+    let referralCode = null;
+    try {
+      referralCode = await ensureReferralCode(m);
+    } catch (refErr) {
+      console.error('Error generating referral code for manually-added customer:', refErr.message);
+    }
+
+    if (sendEmails) {
+      try {
+        await sendSignupEmails({
+          missionaryEmail: m.missionary_email, missionaryName: m.missionary_name, familyEmail: m.family_email,
+          missionStartDate: m.mission_start_date, missionStatus: m.mission_status,
+          dashboardToken: m.dashboard_token, referralCode,
+        });
+      } catch (mailErr) {
+        console.error('Error sending onboarding emails for manually-added customer:', mailErr.message);
+      }
+    }
+
+    res.status(200).json({
+      id: m.id,
+      missionaryEmail: m.missionary_email,
+      familyEmail: m.family_email,
+      paidAmount: parseFloat(m.paid_amount || 0),
+      dashboardUrl: `https://getmissionbridge.com/dashboard.html?token=${dashboardToken}`,
+      referralCode,
+    });
+  } catch (err) {
+    console.error('Error manually creating customer:', err);
+    res.status(500).json({ error: 'Something went wrong creating this customer' });
+  }
+});
+
 // Customer-facing: soft-delete an individual email/update (and its attachments).
 // Requires proof of ownership (the missionary's email or their dashboard
 // token) matched against the actual record - previously this had no
