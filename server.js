@@ -2000,6 +2000,24 @@ app.get('/admin/analytics', requireAdminKey, async (req, res) => {
       [days]
     );
 
+    // The user_agent header was already being logged on every view for
+    // no extra frontend work - this just finally reads it back out, so
+    // we can tell whether drop-off skews mobile vs desktop without
+    // adding any new tracking.
+    const byDevice = await pool.query(
+      `SELECT
+         CASE
+           WHEN user_agent IS NULL THEN 'Unknown'
+           WHEN user_agent ~* 'ipad|tablet' THEN 'Tablet'
+           WHEN user_agent ~* 'mobile|android|iphone' THEN 'Mobile'
+           ELSE 'Desktop'
+         END as device,
+         COUNT(*) as views
+       FROM page_views WHERE viewed_at > NOW() - ($1 || ' days')::interval
+       GROUP BY device ORDER BY views DESC`,
+      [days]
+    );
+
     res.json({
       days: parseInt(days, 10),
       totalViews: parseInt(totals.rows[0].views, 10),
@@ -2007,6 +2025,7 @@ app.get('/admin/analytics', requireAdminKey, async (req, res) => {
       byPage: byPage.rows,
       bySource: bySource.rows,
       byDay: byDay.rows,
+      byDevice: byDevice.rows,
     });
   } catch (err) {
     console.error('Error fetching analytics:', err);
