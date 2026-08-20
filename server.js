@@ -1346,6 +1346,46 @@ app.post('/signup/complete', async (req, res) => {
   }
 });
 
+// Fills in the optional details (missionary's name, family phone,
+// rough mission dates) that the signup form no longer asks for
+// up front - collecting only the missionary email + family email
+// before checkout cut down on pre-payment friction, so this lets the
+// family fill the rest in right after paying instead, when they've
+// already committed. Authenticated by the private dashboard token
+// rather than a login, consistent with the rest of the dashboard
+// access pattern. Every field is optional and only overwrites when a
+// non-empty value is actually sent, so submitting the form twice (or
+// leaving fields blank) never clobbers something already saved.
+app.post('/signup/details', rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: 'Too many attempts. Please try again in a few minutes.' }), async (req, res) => {
+  try {
+    const { token, missionaryName, familyPhone, missionStartDate, expectedReturnDate, missionStatus } = req.body;
+    if (!token) {
+      return res.status(400).json({ error: 'Token is required' });
+    }
+
+    const result = await pool.query(
+      `UPDATE missionaries SET
+         missionary_name = COALESCE(NULLIF($1, ''), missionary_name),
+         family_phone = COALESCE(NULLIF($2, ''), family_phone),
+         mission_start_date = COALESCE(NULLIF($3, '')::date, mission_start_date),
+         expected_return_date = COALESCE(NULLIF($4, '')::date, expected_return_date),
+         mission_status = COALESCE(NULLIF($5, ''), mission_status)
+       WHERE dashboard_token = $6
+       RETURNING id`,
+      [missionaryName || null, familyPhone || null, missionStartDate || null, expectedReturnDate || null, missionStatus || null, token]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'This link is invalid or has expired' });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error saving signup details:', err);
+    res.status(500).json({ error: 'Something went wrong' });
+  }
+});
+
 // Sends the standard pair of onboarding emails (family + missionary),
 // shared by both the regular signup path and the preorder-completion
 // path so the wording only lives in one place.
