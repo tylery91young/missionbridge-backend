@@ -20,6 +20,21 @@ const FOUNDING_SPOTS_CAP = 25;
 const FOUNDING_PRICE_CENTS = 5000; // $50
 const STANDARD_PRICE_CENTS = 7500; // $75
 
+// A missionary's email is a matching key against sender_email on every
+// inbound email - if it gets saved with a display-name/angle-bracket
+// wrapper still attached (e.g. someone pastes "Jonathan Couch
+// <jonathan.couch@missionary.org>" straight from an email client's
+// From line, into either the signup form or the admin panel), it
+// silently stops matching anything and their dashboard looks empty
+// forever with no error anywhere. Strips that wrapper if present,
+// wherever a missionary email gets written, not just at signup.
+function sanitizeMissionaryEmail(input) {
+  if (!input) return input;
+  const bracketMatch = String(input).match(/<([^>]+)>/);
+  const raw = bracketMatch ? bracketMatch[1] : input;
+  return raw.toLowerCase().trim();
+}
+
 async function getFoundingStatus() {
   const result = await pool.query(
     `SELECT COUNT(*) FROM missionaries WHERE paid_amount >= $1`,
@@ -1177,7 +1192,7 @@ app.post('/signup', rateLimit({ windowMs: 15 * 60 * 1000, max: 8, message: 'Too 
       return res.status(400).json({ error: 'Missionary email and family email are both required' });
     }
 
-    const cleanMissionaryEmailForCheck = missionaryEmail.toLowerCase().trim();
+    const cleanMissionaryEmailForCheck = sanitizeMissionaryEmail(missionaryEmail);
 
     // Guard against hijacking an already-paid account: without this,
     // anyone who knew (or guessed) a missionary's address could
@@ -1203,7 +1218,7 @@ app.post('/signup', rateLimit({ windowMs: 15 * 60 * 1000, max: 8, message: 'Too 
          dashboard_token = COALESCE(missionaries.dashboard_token, $8)
        RETURNING *`,
       [
-        missionaryEmail.toLowerCase().trim(),
+        cleanMissionaryEmailForCheck,
         missionaryName || null,
         familyEmail.toLowerCase().trim(),
         familyPhone || null,
@@ -1283,7 +1298,7 @@ app.post('/signup/complete', async (req, res) => {
        WHERE completion_token = $6 AND missionary_email IS NULL
        RETURNING *`,
       [
-        missionaryEmail.toLowerCase().trim(),
+        sanitizeMissionaryEmail(missionaryEmail),
         missionaryName || null,
         expectedReturnDate || null,
         missionStartDate || null,
@@ -1713,7 +1728,7 @@ app.post('/admin/customers/:id', requireAdminKey, async (req, res) => {
          missionary_email = COALESCE(NULLIF($3, ''), missionary_email),
          family_email = COALESCE(NULLIF($4, ''), family_email)
        WHERE id = $5`,
-      [paidAmount, notes, missionaryEmail ? missionaryEmail.toLowerCase().trim() : null, familyEmail ? familyEmail.toLowerCase().trim() : null, req.params.id]
+      [paidAmount, notes, missionaryEmail ? sanitizeMissionaryEmail(missionaryEmail) : null, familyEmail ? familyEmail.toLowerCase().trim() : null, req.params.id]
     );
     res.json({ success: true });
   } catch (err) {
@@ -2174,7 +2189,7 @@ app.post('/admin/customers/manual', requireAdminKey, async (req, res) => {
       return res.status(400).json({ error: 'Missionary email and family email are both required' });
     }
 
-    const cleanMissionaryEmail = missionaryEmail.toLowerCase().trim();
+    const cleanMissionaryEmail = sanitizeMissionaryEmail(missionaryEmail);
     const cleanFamilyEmail = familyEmail.toLowerCase().trim();
 
     const existing = await pool.query(
