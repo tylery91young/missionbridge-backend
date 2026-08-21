@@ -2050,6 +2050,26 @@ app.get('/admin/analytics', requireAdminKey, async (req, res) => {
   }
 });
 
+// Admin: wipe one visitor's page-view history - mainly for Tyler's
+// own testing (find the ID via the browser console: localStorage
+// .getItem('mb_visitor_id')) rather than any real customer, since
+// real visitors are anonymous first-party IDs anyway. Scoped to a
+// single visitor_id rather than a path/date range so it can't
+// accidentally delete real traffic that happens to share a page.
+app.delete('/admin/analytics/pageviews', requireAdminKey, async (req, res) => {
+  try {
+    const visitorId = (req.query.visitorId || '').trim();
+    if (!visitorId) {
+      return res.status(400).json({ error: 'visitorId is required' });
+    }
+    const result = await pool.query(`DELETE FROM page_views WHERE visitor_id = $1`, [visitorId]);
+    res.json({ success: true, deleted: result.rowCount });
+  } catch (err) {
+    console.error('Error purging page views:', err);
+    res.status(500).json({ error: 'Error purging page views' });
+  }
+});
+
 // Admin: see every email where we detected an unparseable link
 // (Drive, Photos, etc) - useful for spotting patterns across customers,
 // like "lots of people are hitting this," not just one-off alerts.
