@@ -563,9 +563,12 @@ app.post('/webhook', upload.any(), async (req, res) => {
     const emailMatch = from.match(/<(.+?)>/);
     const cleanFromAddress = (emailMatch ? emailMatch[1] : from).toLowerCase().trim();
 
-    // Look up which missionary this email belongs to, if registered
+    // Look up which missionary this email belongs to, if registered.
+    // Matches either the missionary's own address OR the family's -
+    // lets a parent forward past updates to catch up on anything sent
+    // before signup, not just the missionary sending directly.
     const missionaryLookup = await pool.query(
-      `SELECT * FROM missionaries WHERE missionary_email = $1`,
+      `SELECT * FROM missionaries WHERE missionary_email = $1 OR family_email = $1`,
       [cleanFromAddress]
     );
     const missionary = missionaryLookup.rows[0] || null;
@@ -573,6 +576,13 @@ app.post('/webhook', upload.any(), async (req, res) => {
     if (!missionary) {
       console.log(`Warning: received email from unregistered address: ${cleanFromAddress}`);
     }
+
+    // Always attribute to the missionary's canonical email once
+    // matched, regardless of which registered address actually sent
+    // it - otherwise a parent's forward would get stored under the
+    // family's own email and never show up on the dashboard, which
+    // always looks up by the missionary's address.
+    const canonicalSenderEmail = missionary ? missionary.missionary_email : cleanFromAddress;
 
     // Detect specifically what kind of unparseable content this email
     // might contain, so the dashboard can tell the family exactly what
@@ -609,7 +619,7 @@ app.post('/webhook', upload.any(), async (req, res) => {
     const result = await pool.query(
       `INSERT INTO emails (from_address, sender_email, subject, body_text, has_drive_link, detected_issue_type, is_mostly_link)
        VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-      [from, cleanFromAddress, subject, text, hasAnyUnparseableLink, detectedIssueType, isMostlyJustALink]
+      [from, canonicalSenderEmail, subject, text, hasAnyUnparseableLink, detectedIssueType, isMostlyJustALink]
     );
     const emailId = result.rows[0].id;
 
