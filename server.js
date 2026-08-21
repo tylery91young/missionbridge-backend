@@ -1454,6 +1454,7 @@ async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, 
       `3. Set up Google Photos Partner Sharing too: ${guideUrl}\n` +
       `Mission Bridge Archive saves everything they email home, but their phone holds a lot more photos than they'll ever email. Partner Sharing is the most foolproof way to catch everything else, and it's much easier to set up now than to fix it after the fact.${midMissionNote}${referralNote}\n\n` +
       `4. If anything looks off, an update doesn't show up, or you just have a question, email me anytime at tyler@getmissionbridge.com. I'd genuinely rather hear from you than have you wonder.\n\n` +
+      `One more thing: once this has been running for you for a while and you're happy with it, a quick Google review would mean a lot and helps other missionary families find us too: https://g.page/r/CZs1Jzv7nsQDEBM/review\n\n` +
       `I built this because I wanted families to have one less thing to worry about during a mission. I hope it gives you some peace of mind.`,
       `<p>Hi! I'm Tyler, the person behind Mission Bridge Archive.</p>` +
       `<p>Thanks so much for giving this a try.</p>` +
@@ -1471,6 +1472,7 @@ async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, 
       midMissionNoteHtml +
       referralNoteHtml +
       `<p><strong>4. If anything looks off,</strong> an update doesn't show up, or you just have a question, email me anytime at <a href="mailto:tyler@getmissionbridge.com">tyler@getmissionbridge.com</a>. I'd genuinely rather hear from you than have you wonder.</p>` +
+      `<p><strong>One more thing:</strong> once this has been running for you for a while and you're happy with it, a quick <a href="https://g.page/r/CZs1Jzv7nsQDEBM/review">Google review</a> would mean a lot and helps other missionary families find us too.</p>` +
       `<p>I built this because I wanted families to have one less thing to worry about during a mission. I hope it gives you some peace of mind.</p>`,
       'welcome'
     );
