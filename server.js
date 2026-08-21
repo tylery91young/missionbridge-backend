@@ -1441,14 +1441,19 @@ async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, 
   const firstName = (missionaryName || '').trim().split(' ')[0];
 
   // If they're already out serving (not a brand-new signup right as
-  // they leave), the single highest-value tip is making sure Partner
-  // Sharing is set to catch photos from before signup too, not just
-  // going forward. Worth a dedicated line rather than burying it.
+  // they leave), two things are worth doing right away to catch up on
+  // what's already happened, not just what's coming: Partner Sharing
+  // set to "all photos" (not just going forward), and forwarding past
+  // emails in manually since those never get pulled in automatically.
   const midMissionNote = missionStatus === 'serving'
-    ? `\n\nOne more thing, since they're already out serving: when you set up Partner Sharing in the guide above, make sure it's set to share ALL photos, not just "since a specific date" - otherwise anything from before today never gets backed up.`
+    ? `\n\nTwo things worth doing since they're already out serving: (1) When you set up Partner Sharing in the guide above, make sure it's set to share ALL photos, not just "since a specific date" - otherwise anything from before today never gets backed up. (2) You or your missionary can also forward their past emails to archive@parse.getmissionbridge.com so we save those too - sending them in the order they were originally sent works best.`
     : '';
   const midMissionNoteHtml = missionStatus === 'serving'
-    ? `<p><strong>One more thing,</strong> since they're already out serving: when you set up Partner Sharing in the guide above, make sure it's set to share <strong>all photos</strong>, not just "since a specific date" - otherwise anything from before today never gets backed up.</p>`
+    ? `<p><strong>Two things worth doing</strong> since they're already out serving:</p>` +
+      `<ol>` +
+      `<li>When you set up Partner Sharing in the guide above, make sure it's set to share <strong>all photos</strong>, not just "since a specific date" - otherwise anything from before today never gets backed up.</li>` +
+      `<li>You or your missionary can also forward their past emails to <code>archive@parse.getmissionbridge.com</code> so we save those too - sending them in the order they were originally sent works best.</li>` +
+      `</ol>`
     : '';
 
   // Operation Wildfire: only included if a code actually got created
@@ -1517,6 +1522,16 @@ async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, 
     const confirmUrl = `https://missionbridge-backend.onrender.com/track/confirm/${trackingToken}`;
     const pixelUrl = `https://missionbridge-backend.onrender.com/track/open/${trackingToken}`;
 
+    // Mirrors the family's catch-up note above, from the missionary's
+    // side - forwarding is the only way to bring in anything they sent
+    // before today, since the archive address only sees new emails.
+    const missionaryCatchUpNote = missionStatus === 'serving'
+      ? `\n\nSince you're already out serving: any emails you've already sent home won't be caught automatically, but you can forward those to the address above too, so nothing from before today gets missed either. Sending them in the order you originally sent them works best.`
+      : '';
+    const missionaryCatchUpNoteHtml = missionStatus === 'serving'
+      ? `<p><strong>Since you're already out serving:</strong> any emails you've already sent home won't be caught automatically, but you can forward those to the address above too, so nothing from before today gets missed either. Sending them in the order you originally sent them works best.</p>`
+      : '';
+
     await sendMissionaryEmail(
       cleanMissionaryEmail,
       'Your family set this up to save your emails home',
@@ -1524,7 +1539,7 @@ async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, 
       `Your family signed up for Mission Bridge Archive, which automatically saves your emails, photos, and voice memos so nothing gets lost while you're serving. There's nothing for you to pay or set up beyond the one step below.\n\n` +
       `All you need to do: add this address to your regular email list, the same way you'd add anyone else you send your update to:\n\n` +
       `archive@parse.getmissionbridge.com\n\n` +
-      `That's it for emails. Any time you email your update home with that address included, your message and anything you attach gets saved automatically. No app to download, nothing else to set up.\n\n` +
+      `That's it for emails. Any time you email your update home with that address included, your message and anything you attach gets saved automatically. No app to download, nothing else to set up.${missionaryCatchUpNote}\n\n` +
       `One more thing worth doing now, while you're already reading this: your phone holds a lot more photos than you'll ever email home. Google Photos has a free feature called Partner Sharing that backs those up automatically too. It only takes a minute:\n\n` +
       `1. Open Google Photos on your phone\n` +
       `2. Tap your profile picture (top right), then Partner Sharing\n` +
@@ -1538,6 +1553,7 @@ async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, 
       `<p><strong>All you need to do:</strong> add this address to your regular email list, the same way you'd add anyone else you send your update to:</p>` +
       `<p><code>archive@parse.getmissionbridge.com</code></p>` +
       `<p>That's it for emails. Any time you email your update home with that address included, your message and anything you attach gets saved automatically. No app to download, nothing else to set up.</p>` +
+      missionaryCatchUpNoteHtml +
       `<p><strong>One more thing worth doing now,</strong> while you're already reading this: your phone holds a lot more photos than you'll ever email home. Google Photos has a free feature called Partner Sharing that backs those up automatically too. It only takes a minute:</p>` +
       `<ol>` +
       `<li>Open Google Photos on your phone</li>` +
