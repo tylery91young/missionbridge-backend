@@ -337,6 +337,40 @@ async function initDb() {
     );
   `);
 
+  // Photo Save Guide - a separate $5 paid product from The Bridge.
+  // Tracks the buyer's contact info (for a later Bridge upsell, the
+  // whole point of pricing it low) and an access_token so they can
+  // return to the guide anytime without re-buying. missionary_id is
+  // only set when they added the Bridge as a bundle add-on at
+  // checkout, linking this purchase to that new missionaries row.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS guide_purchases (
+      id SERIAL PRIMARY KEY,
+      email TEXT NOT NULL,
+      name TEXT,
+      phone TEXT,
+      paid_amount NUMERIC NOT NULL DEFAULT 5,
+      access_token TEXT UNIQUE,
+      bridge_added_on BOOLEAN DEFAULT FALSE,
+      missionary_id INTEGER REFERENCES missionaries(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  // Short difficulty/problems form shown after someone finishes the
+  // Photo Save Guide - the guide's real-world accuracy hasn't been
+  // independently verified yet, so this is how actual usage feedback
+  // gets back to Tyler instead of errors sitting undiscovered.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS guide_feedback (
+      id SERIAL PRIMARY KEY,
+      difficulty TEXT,
+      comments TEXT,
+      email TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
   console.log('Database tables ready.');
 }
 

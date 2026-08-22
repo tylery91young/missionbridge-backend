@@ -89,6 +89,59 @@ setInterval(() => {
   }
 }, 60 * 60 * 1000);
 
+// Attempts to fetch a Google Drive share link's actual file content
+// directly, with no OAuth or API key - works only for links shared as
+// "anyone with the link," using Drive's direct-download URL. Returns
+// null for anything we can't or shouldn't try: folder links (no
+// single file to grab, would need real API access to list contents),
+// links with no recognizable file ID, and - implicitly, since the
+// fetch just comes back as an HTML page instead of a file - private/
+// restricted shares and files large enough to trigger Google's
+// virus-scan confirmation page. All of those fall through to the
+// existing "we found a link we can't access" alert exactly as before.
+async function attemptDriveFileFetch(url) {
+  if (/\/drive\.google\.com\/drive\/folders\//i.test(url)) return null;
+
+  const idMatch = url.match(/\/file\/d\/([a-zA-Z0-9_-]+)/) || url.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+  const fileId = idMatch ? idMatch[1] : null;
+  if (!fileId) return null;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    let response;
+    try {
+      response = await fetch(`https://drive.google.com/uc?export=download&id=${fileId}`, {
+        signal: controller.signal,
+        redirect: 'follow',
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if (!response.ok) return null;
+
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    if (contentType.includes('text/html')) return null;
+
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    // Same size caution already given for regular email attachments -
+    // don't silently swallow something huge.
+    if (buffer.length === 0 || buffer.length > 50 * 1024 * 1024) return null;
+
+    const disposition = response.headers.get('content-disposition') || '';
+    const nameMatch = disposition.match(/filename="?([^";]+)"?/);
+    const extFromType = contentType.split('/')[1]?.split(';')[0] || 'bin';
+    const filename = nameMatch ? nameMatch[1] : `drive-file-${fileId}.${extFromType}`;
+
+    return { buffer, filename, mimeType: contentType.split(';')[0] || 'application/octet-stream' };
+  } catch (err) {
+    console.error(`Error auto-fetching Drive link (file ${fileId}):`, err.message);
+    return null;
+  }
+}
+
 // Some email clients send a generic mimetype instead of the real one.
 // This fills in the correct type based on file extension as a backup.
 function resolveMimeType(originalMimeType, filename) {
@@ -356,7 +409,16 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
     const session = event.data.object;
     const missionaryId = session.metadata?.missionaryId;
     const isNewSignup = session.metadata?.isNewSignup === 'true';
-    const amountPaid = session.amount_total ? session.amount_total / 100 : 0;
+    const guidePurchaseId = session.metadata?.guidePurchaseId;
+    const bridgeAmountCents = session.metadata?.bridgeAmountCents;
+    // Bundle checkouts (Photo Save Guide + Bridge add-on in one Stripe
+    // session) charge the Bridge at a discounted rate baked into that
+    // combined session - its real price comes from metadata here,
+    // never from session.amount_total, which would otherwise fold the
+    // guide's $5 into the Bridge's own paid_amount too.
+    const amountPaid = bridgeAmountCents
+      ? parseFloat(bridgeAmountCents) / 100
+      : (session.amount_total ? session.amount_total / 100 : 0);
 
     if (missionaryId) {
       try {
@@ -411,8 +473,48 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
       } catch (err) {
         console.error(`Error updating paid_amount for missionary #${missionaryId}:`, err);
       }
-    } else {
-      console.error('Stripe checkout.session.completed had no missionaryId in metadata:', session.id);
+    }
+
+    // Photo Save Guide fulfillment - independent of the missionary
+    // block above, since a guide-only purchase has no missionaryId at
+    // all, and a bundled purchase runs both blocks in the same event.
+    // The row (and its access_token) already exists from checkout
+    // creation - this just confirms payment and emails the access
+    // link, the same "create now, notify after payment" pattern used
+    // for the Bridge's own onboarding emails.
+    if (guidePurchaseId) {
+      try {
+        const guideResult = await pool.query(`SELECT * FROM guide_purchases WHERE id = $1`, [guidePurchaseId]);
+        const purchase = guideResult.rows[0];
+        if (purchase && purchase.access_token) {
+          const guideUrl = `https://getmissionbridge.com/photo-guide.html?token=${purchase.access_token}`;
+          try {
+            await sendEmail(
+              purchase.email,
+              'Your Photo Save Guide is ready',
+              `Thanks for your purchase! Here's your guide, ready whenever you want it:\n\n${guideUrl}\n\n` +
+              `Bookmark this link - it's the way back in anytime, no account or password needed.\n\n` +
+              `Not happy with it for any reason? Just reply to this email within 30 days for a full refund, no questions asked.\n\n` +
+              `Questions? Email tyler@getmissionbridge.com anytime.`,
+              `<p>Thanks for your purchase! Here's your guide, ready whenever you want it:</p>` +
+              `<p><a href="${guideUrl}">${guideUrl}</a></p>` +
+              `<p>Bookmark this link - it's the way back in anytime, no account or password needed.</p>` +
+              `<p>Not happy with it for any reason? Just reply to this email within 30 days for a full refund, no questions asked.</p>` +
+              `<p>Questions? Email <a href="mailto:tyler@getmissionbridge.com">tyler@getmissionbridge.com</a> anytime.</p>`,
+              'guide_purchase_confirmation'
+            );
+            console.log(`Sent guide access email for purchase #${guidePurchaseId}`);
+          } catch (mailErr) {
+            console.error(`Error sending guide access email for purchase #${guidePurchaseId}:`, mailErr);
+          }
+        }
+      } catch (err) {
+        console.error(`Error fulfilling guide purchase #${guidePurchaseId}:`, err);
+      }
+    }
+
+    if (!missionaryId && !guidePurchaseId) {
+      console.error('Stripe checkout.session.completed had no missionaryId or guidePurchaseId in metadata:', session.id);
     }
   }
 
@@ -593,7 +695,16 @@ app.post('/webhook', upload.any(), async (req, res) => {
     const driveLinksFound = text.match(drivePattern) || [];
     const photosLinksFound = text.match(photosPattern) || [];
 
-    const hasDriveLink = driveLinksFound.length > 0;
+    // Best-effort: try to actually grab the file behind each Drive
+    // link before giving up on it. Only works for a subset of cases
+    // (single files shared as "anyone with the link"), so anything
+    // that comes back null just falls through to the existing alert
+    // flow below, same as if we'd never tried.
+    const driveFetchResults = await Promise.all(driveLinksFound.map(link => attemptDriveFileFetch(link)));
+    const successfulDriveFiles = driveFetchResults.filter(Boolean);
+    const unfetchedDriveLinks = driveLinksFound.filter((link, i) => !driveFetchResults[i]);
+
+    const hasDriveLink = unfetchedDriveLinks.length > 0;
     const hasPhotosLink = photosLinksFound.length > 0;
     const hasAnyUnparseableLink = hasDriveLink || hasPhotosLink;
 
@@ -626,7 +737,7 @@ app.post('/webhook', upload.any(), async (req, res) => {
     // If we found a link we can't access, alert the family right away
     // so they can save it themselves in time.
     if (hasAnyUnparseableLink && missionary) {
-      const exampleLink = driveLinksFound[0] || photosLinksFound[0];
+      const exampleLink = unfetchedDriveLinks[0] || photosLinksFound[0];
       const linkTypeLabel = hasPhotosLink ? 'Google Photos' : 'Google Drive';
 
       try {
@@ -661,6 +772,30 @@ app.post('/webhook', upload.any(), async (req, res) => {
          VALUES ($1, $2, $3, $4, $5)`,
         [emailId, file.originalname, r2Key, correctMimeType, file.size]
       );
+    }
+
+    // Save anything successfully auto-fetched from a public Drive
+    // link the same way as a real attachment - the family shouldn't
+    // be able to tell the difference on their dashboard.
+    for (const driveFile of successfulDriveFiles) {
+      try {
+        const tempPath = `/tmp/uploads/drive-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        fs.writeFileSync(tempPath, driveFile.buffer);
+        const r2Key = `email-${emailId}/${Date.now()}-${driveFile.filename}`;
+        const correctMimeType = resolveMimeType(driveFile.mimeType, driveFile.filename);
+
+        await uploadToR2(tempPath, r2Key, correctMimeType);
+        fs.unlinkSync(tempPath);
+
+        await pool.query(
+          `INSERT INTO attachments (email_id, original_name, saved_as, mime_type, size_bytes)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [emailId, driveFile.filename, r2Key, correctMimeType, driveFile.buffer.length]
+        );
+        console.log(`Auto-fetched a Google Drive file for email #${emailId}: ${driveFile.filename}`);
+      } catch (err) {
+        console.error(`Error saving auto-fetched Drive file for email #${emailId}:`, err.message);
+      }
     }
 
     console.log(`Saved email #${emailId} from ${from}: "${subject}" with ${files.length} attachment(s)`);
@@ -1408,6 +1543,135 @@ app.post('/signup/details', rateLimit({ windowMs: 15 * 60 * 1000, max: 20, messa
   } catch (err) {
     console.error('Error saving signup details:', err);
     res.status(500).json({ error: 'Something went wrong' });
+  }
+});
+
+// Photo Save Guide checkout - a separate $5 product from the Bridge.
+// Optionally bundles the Bridge in the same Stripe session at a
+// discounted $45 (so the combined total lands on the same $50 as
+// buying it alone), in which case this also creates the missionary
+// row up front, same "create now, confirm via webhook" pattern the
+// main /signup route uses.
+app.post('/guide/checkout', rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: 'Too many attempts. Please try again in a few minutes.' }), async (req, res) => {
+  try {
+    const { email, name, phone, addBridge, missionaryEmail, missionaryEmailConfirm } = req.body;
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+    if (!stripe) {
+      return res.status(500).json({ error: 'Payments are not configured yet' });
+    }
+    const cleanEmail = email.toLowerCase().trim();
+
+    let missionaryId = null;
+
+    if (addBridge) {
+      if (!missionaryEmail || !missionaryEmailConfirm) {
+        return res.status(400).json({ error: 'Missionary email and confirmation are both required to add the Bridge' });
+      }
+      if (missionaryEmail.toLowerCase().trim() !== missionaryEmailConfirm.toLowerCase().trim()) {
+        return res.status(400).json({ error: "Those missionary email addresses don't match" });
+      }
+
+      const cleanMissionaryEmailForCheck = sanitizeMissionaryEmail(missionaryEmail);
+
+      // Same hijack guard as /signup - without it, someone could
+      // resubmit a stranger's already-paid missionary address here too.
+      const existingMissionary = await pool.query(
+        `SELECT id, paid_amount FROM missionaries WHERE missionary_email = $1`,
+        [cleanMissionaryEmailForCheck]
+      );
+      if (existingMissionary.rows[0] && parseFloat(existingMissionary.rows[0].paid_amount || 0) > 0) {
+        return res.status(409).json({ error: 'This missionary already has an active account. If this is your family and you need help, please contact us.' });
+      }
+
+      const dashboardToken = crypto.randomBytes(24).toString('hex');
+      const missionaryResult = await pool.query(
+        `INSERT INTO missionaries (missionary_email, family_email, dashboard_token, mission_status)
+         VALUES ($1, $2, $3, 'serving')
+         ON CONFLICT (missionary_email) DO UPDATE SET
+           family_email = $2, dashboard_token = COALESCE(missionaries.dashboard_token, $3)
+         RETURNING id`,
+        [cleanMissionaryEmailForCheck, cleanEmail, dashboardToken]
+      );
+      missionaryId = missionaryResult.rows[0].id;
+    }
+
+    const accessToken = crypto.randomBytes(24).toString('hex');
+    const guideResult = await pool.query(
+      `INSERT INTO guide_purchases (email, name, phone, paid_amount, access_token, bridge_added_on, missionary_id)
+       VALUES ($1, $2, $3, 5, $4, $5, $6) RETURNING id`,
+      [cleanEmail, name || null, phone || null, accessToken, !!addBridge, missionaryId]
+    );
+    const guidePurchaseId = guideResult.rows[0].id;
+
+    const lineItems = [{
+      price_data: {
+        currency: 'usd',
+        product_data: {
+          name: 'Photo Save Guide',
+          description: "Step-by-step guide to backing up your missionary's Google Photos",
+        },
+        unit_amount: 500,
+      },
+      quantity: 1,
+    }];
+
+    const metadata = { guidePurchaseId: String(guidePurchaseId) };
+
+    if (addBridge) {
+      lineItems.push({
+        price_data: {
+          currency: 'usd',
+          product_data: {
+            name: 'The Bridge (bundle price)',
+            description: "Automatic backup of every email and photo your missionary sends home",
+          },
+          unit_amount: 4500,
+        },
+        quantity: 1,
+      });
+      metadata.missionaryId = String(missionaryId);
+      metadata.isNewSignup = 'true';
+      metadata.bridgeAmountCents = '4500';
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      payment_method_types: ['card'],
+      customer_email: cleanEmail,
+      line_items: lineItems,
+      metadata,
+      success_url: `https://getmissionbridge.com/guide-welcome.html?email=${encodeURIComponent(cleanEmail)}`,
+      cancel_url: 'https://getmissionbridge.com/photo-save-guide.html',
+    });
+
+    res.status(200).json({ checkoutUrl: session.url });
+  } catch (err) {
+    console.error('Error creating guide checkout:', err);
+    res.status(500).json({ error: 'Something went wrong' });
+  }
+});
+
+// Public: does this token unlock the Photo Save Guide? Accepts either
+// a real guide_purchases.access_token or a Bridge customer's own
+// dashboard_token, since Bridge customers get the guide included free
+// and shouldn't need a second, separate purchase/token to prove it.
+app.get('/guide/verify-access', rateLimit({ windowMs: 15 * 60 * 1000, max: 60, message: 'Too many attempts. Please try again in a few minutes.' }), async (req, res) => {
+  try {
+    const token = (req.query.token || '').trim();
+    if (!token) return res.json({ valid: false });
+
+    const guideCheck = await pool.query(`SELECT id FROM guide_purchases WHERE access_token = $1`, [token]);
+    if (guideCheck.rows.length > 0) return res.json({ valid: true });
+
+    const bridgeCheck = await pool.query(`SELECT id FROM missionaries WHERE dashboard_token = $1`, [token]);
+    if (bridgeCheck.rows.length > 0) return res.json({ valid: true });
+
+    res.json({ valid: false });
+  } catch (err) {
+    console.error('Error verifying guide access:', err);
+    res.status(500).json({ valid: false });
   }
 });
 
@@ -2297,6 +2561,54 @@ app.post('/admin/customers/manual', requireAdminKey, async (req, res) => {
   } catch (err) {
     console.error('Error manually creating customer:', err);
     res.status(500).json({ error: 'Something went wrong creating this customer' });
+  }
+});
+
+// Public: short difficulty/problems form shown after someone finishes
+// the Photo Save Guide. The guide's real-world accuracy hasn't been
+// independently verified yet, so this is the feedback channel that
+// catches it if a step is wrong or out of date, instead of it sitting
+// silently broken for the next buyer.
+app.post('/guide-feedback', rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: 'Too many attempts. Please try again in a few minutes.' }), async (req, res) => {
+  try {
+    const { difficulty, comments, email } = req.body;
+    await pool.query(
+      `INSERT INTO guide_feedback (difficulty, comments, email) VALUES ($1, $2, $3)`,
+      [(difficulty || '').slice(0, 100) || null, (comments || '').slice(0, 5000) || null, (email || '').slice(0, 200) || null]
+    );
+    res.status(200).json({ success: true });
+  } catch (err) {
+    console.error('Error saving guide feedback:', err);
+    res.status(500).json({ error: 'Something went wrong' });
+  }
+});
+
+// Admin: everyone who's bought the Photo Save Guide - the whole point
+// of pricing it low is having real contact info to follow up and
+// upsell the Bridge later, so this is meant to actually be worked,
+// not just observed.
+app.get('/admin/guide-purchases', requireAdminKey, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT gp.*, m.missionary_email, m.paid_amount as bridge_paid_amount
+      FROM guide_purchases gp
+      LEFT JOIN missionaries m ON gp.missionary_id = m.id
+      ORDER BY gp.created_at DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching guide purchases:', err);
+    res.status(500).json({ error: 'Error fetching guide purchases' });
+  }
+});
+
+app.get('/admin/guide-feedback', requireAdminKey, async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT * FROM guide_feedback ORDER BY created_at DESC`);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching guide feedback:', err);
+    res.status(500).json({ error: 'Error fetching guide feedback' });
   }
 });
 
