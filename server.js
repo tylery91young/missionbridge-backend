@@ -1642,7 +1642,7 @@ app.post('/guide/checkout', rateLimit({ windowMs: 15 * 60 * 1000, max: 10, messa
       customer_email: cleanEmail,
       line_items: lineItems,
       metadata,
-      success_url: `https://getmissionbridge.com/guide-welcome.html?email=${encodeURIComponent(cleanEmail)}`,
+      success_url: `https://getmissionbridge.com/guide-welcome.html?email=${encodeURIComponent(cleanEmail)}&token=${accessToken}`,
       cancel_url: 'https://getmissionbridge.com/photo-save-guide.html',
     });
 
@@ -1701,7 +1701,13 @@ async function sendSignupEmails({ missionaryEmail, missionaryName, familyEmail, 
   const dashboardUrl = dashboardToken
     ? `https://getmissionbridge.com/dashboard.html?token=${encodeURIComponent(dashboardToken)}`
     : `https://getmissionbridge.com/dashboard.html?email=${encodeURIComponent(cleanMissionaryEmail)}`;
-  const guideUrl = 'https://getmissionbridge.com/photo-guide.html';
+  // The guide is now a separate paid product, gated behind a token -
+  // Bridge customers still get it included free, so this reuses their
+  // existing dashboard_token as proof rather than asking them to buy
+  // a second time (the gate accepts either kind of token).
+  const guideUrl = dashboardToken
+    ? `https://getmissionbridge.com/photo-guide.html?token=${encodeURIComponent(dashboardToken)}`
+    : 'https://getmissionbridge.com/photo-save-guide.html';
   const firstName = (missionaryName || '').trim().split(' ')[0];
 
   // If they're already out serving (not a brand-new signup right as
@@ -2682,7 +2688,9 @@ async function checkAndSendPhotoGuides() {
 
     for (const m of result.rows) {
       const firstName = (m.missionary_name || '').trim().split(' ')[0] || 'your missionary';
-      const guideUrl = 'https://getmissionbridge.com/photo-guide.html';
+      const guideUrl = m.dashboard_token
+        ? `https://getmissionbridge.com/photo-guide.html?token=${encodeURIComponent(m.dashboard_token)}`
+        : 'https://getmissionbridge.com/photo-save-guide.html';
       try {
         await sendEmail(
           m.family_email,
