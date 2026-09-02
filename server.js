@@ -1156,6 +1156,26 @@ app.get('/dashboard/by-token/:token', async (req, res) => {
   }
 });
 
+// Lets a family flag from their dashboard that their missionary came
+// home early. Informational only - see the came_home_early_at comment
+// in db.js for why this doesn't change any timing.
+app.post('/dashboard/:missionaryEmail/home-early', async (req, res) => {
+  try {
+    const missionaryEmail = req.params.missionaryEmail.toLowerCase().trim();
+    const result = await pool.query(
+      `UPDATE missionaries SET came_home_early_at = NOW() WHERE missionary_email = $1 RETURNING came_home_early_at`,
+      [missionaryEmail]
+    );
+    if (!result.rows[0]) {
+      return res.status(404).json({ error: 'Missionary not found' });
+    }
+    res.json({ success: true, cameHomeEarlyAt: result.rows[0].came_home_early_at });
+  } catch (err) {
+    console.error('Error flagging came-home-early:', err);
+    res.status(500).json({ error: 'Error saving that' });
+  }
+});
+
 // Lets the family turn downloads on/off for anyone they share their link with
 app.post('/dashboard/:missionaryEmail/permissions', async (req, res) => {
   try {
@@ -1997,6 +2017,7 @@ app.get('/admin/customers', requireAdminKey, async (req, res) => {
           paidAmount: parseFloat(m.paid_amount || 0),
           notes: m.notes,
           deletionRequestedAt: m.deletion_requested_at,
+          cameHomeEarlyAt: m.came_home_early_at,
           missionStartDate: m.mission_start_date,
           signedUpAt: m.created_at,
           daysSinceSignup,

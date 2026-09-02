@@ -133,6 +133,16 @@ async function initDb() {
   await pool.query(`
     ALTER TABLE missionaries ADD COLUMN IF NOT EXISTS last_reentry_email_sent_at TIMESTAMPTZ;
   `);
+  // Lets a family flag from their own dashboard that their missionary
+  // came home before the expected_return_date on file. Informational
+  // only - the reentry checklist/welcome-home sequence still fires off
+  // expected_return_date as before (Tyler's call: storage and the
+  // eventual notifications can wait until then either way), this just
+  // gives him visibility in the admin panel that the date on file is
+  // no longer accurate.
+  await pool.query(`
+    ALTER TABLE missionaries ADD COLUMN IF NOT EXISTS came_home_early_at TIMESTAMPTZ;
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS waitlist (
