@@ -1935,6 +1935,12 @@ app.get('/admin/overview', requireAdminKey, async (req, res) => {
     const missionaryCount = await pool.query(`SELECT COUNT(*) FROM missionaries WHERE is_removed = FALSE`);
     const totalRevenue = await pool.query(`SELECT COALESCE(SUM(paid_amount), 0) as total FROM missionaries`);
     const paidCustomerCount = await pool.query(`SELECT COUNT(*) FROM missionaries WHERE paid_amount > 0`);
+    const openLeadsCount = await pool.query(`
+      SELECT COUNT(*) FROM missionaries
+      WHERE COALESCE(paid_amount, 0) = 0
+        AND is_removed = FALSE
+        AND (notes IS NULL OR notes NOT ILIKE '%manually added by admin%')
+    `);
     const totalExpenditures = await pool.query(`SELECT COALESCE(SUM(amount), 0) as total FROM expenditures`);
     const totalAttachmentSize = await pool.query(`SELECT COALESCE(SUM(size_bytes), 0) as total FROM attachments WHERE is_deleted = FALSE`);
     const totalEmails = await pool.query(`SELECT COUNT(*) FROM emails WHERE is_deleted = FALSE`);
@@ -1958,6 +1964,7 @@ app.get('/admin/overview', requireAdminKey, async (req, res) => {
 
     res.json({
       totalCustomers: parseInt(missionaryCount.rows[0].count, 10),
+      openLeads: parseInt(openLeadsCount.rows[0].count, 10),
       totalRevenue: revenueTotal,
       totalExpenditures: parseFloat(totalExpenditures.rows[0].total),
       netProfit: revenueTotal - parseFloat(totalExpenditures.rows[0].total),
@@ -2031,6 +2038,71 @@ app.get('/admin/customers', requireAdminKey, async (req, res) => {
   } catch (err) {
     console.error('Error building customer list:', err);
     res.status(500).json({ error: 'Error fetching customers' });
+  }
+});
+
+// Leads: signups that never completed payment. A row shows up here the
+// moment the signup form is submitted - paid_amount stays 0 until the
+// Stripe webhook confirms a real charge - and drops off on its own
+// once paid_amount > 0. Manually-added comped accounts (created via
+// /admin/customers/manual, which always appends "Manually added by
+// admin" to notes) are filtered out here: they're real customers, not
+// unconverted leads.
+const LEADS_WHERE = `
+  COALESCE(paid_amount, 0) = 0
+  AND is_removed = FALSE
+  AND (notes IS NULL OR notes NOT ILIKE '%manually added by admin%')
+`;
+
+app.get('/admin/leads', requireAdminKey, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT id, missionary_name, missionary_email, family_email, family_phone,
+             mission_status, notes, created_at, lead_reachout_1_at, lead_reachout_2_at
+      FROM missionaries
+      WHERE ${LEADS_WHERE}
+      ORDER BY created_at DESC
+    `);
+
+    res.json(result.rows.map(m => ({
+      id: m.id,
+      missionaryName: m.missionary_name,
+      missionaryEmail: m.missionary_email,
+      familyEmail: m.family_email,
+      familyPhone: m.family_phone,
+      isPreorder: m.mission_status === 'preorder' || !m.missionary_email,
+      notes: m.notes,
+      filledOutAt: m.created_at,
+      daysSinceSignup: Math.floor((Date.now() - new Date(m.created_at)) / (1000 * 60 * 60 * 24)),
+      reachout1At: m.lead_reachout_1_at,
+      reachout2At: m.lead_reachout_2_at,
+    })));
+  } catch (err) {
+    console.error('Error building leads list:', err);
+    res.status(500).json({ error: 'Error fetching leads' });
+  }
+});
+
+// Toggle one of the two manual follow-up markers on a lead. `done`
+// stamps NOW(); clearing it (undo) sets NULL. `which` is checked
+// against a fixed whitelist before it ever reaches the query, so it
+// can't be used to target any other column.
+app.post('/admin/leads/:id/reachout', requireAdminKey, async (req, res) => {
+  try {
+    const which = parseInt(req.body.which, 10);
+    const done = req.body.done === true || req.body.done === 'true';
+    if (which !== 1 && which !== 2) {
+      return res.status(400).json({ error: 'which must be 1 or 2' });
+    }
+    const col = which === 1 ? 'lead_reachout_1_at' : 'lead_reachout_2_at';
+    await pool.query(
+      `UPDATE missionaries SET ${col} = ${done ? 'NOW()' : 'NULL'} WHERE id = $1`,
+      [req.params.id]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error updating lead reach-out:', err);
+    res.status(500).json({ error: 'Error updating lead' });
   }
 });
 

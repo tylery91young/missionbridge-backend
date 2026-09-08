@@ -143,6 +143,18 @@ async function initDb() {
   await pool.query(`
     ALTER TABLE missionaries ADD COLUMN IF NOT EXISTS came_home_early_at TIMESTAMPTZ;
   `);
+  // "Leads" = someone who submitted the signup form but never finished
+  // Stripe checkout, so paid_amount stayed 0. These two timestamps are
+  // a lightweight manual follow-up tracker shown in the admin Leads
+  // tab - set to NOW() from the admin panel when a reach-out is made,
+  // cleared back to NULL to undo. Nothing automated reads them; a row
+  // leaves the Leads list on its own once paid_amount > 0.
+  await pool.query(`
+    ALTER TABLE missionaries ADD COLUMN IF NOT EXISTS lead_reachout_1_at TIMESTAMPTZ;
+  `);
+  await pool.query(`
+    ALTER TABLE missionaries ADD COLUMN IF NOT EXISTS lead_reachout_2_at TIMESTAMPTZ;
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS waitlist (
