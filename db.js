@@ -155,6 +155,27 @@ async function initDb() {
   await pool.query(`
     ALTER TABLE missionaries ADD COLUMN IF NOT EXISTS lead_reachout_2_at TIMESTAMPTZ;
   `);
+  // Explicit "this is a real customer, just not a paying one" flag -
+  // free/comped families (like Tyler's own test family) were
+  // previously indistinguishable from an abandoned $0 lead unless
+  // their notes happened to contain the exact text "manually added by
+  // admin" (only auto-added by the /admin/customers/manual route).
+  // Anything comped a different way - hand-edited, or set up before
+  // that route existed - had no marker at all, so it got swept up as
+  // a lead once admin views started filtering leads out of the
+  // customer list. This column replaces that fragile text match as
+  // the real signal, going forward.
+  await pool.query(`
+    ALTER TABLE missionaries ADD COLUMN IF NOT EXISTS is_comped BOOLEAN DEFAULT FALSE;
+  `);
+  // Backfill: anything already relying on the old notes-text
+  // convention gets the real flag too, so nothing that was correctly
+  // classified before regresses. Only touches rows not already
+  // flagged, so it's a no-op on every boot after the first.
+  await pool.query(`
+    UPDATE missionaries SET is_comped = TRUE
+    WHERE COALESCE(is_comped, FALSE) = FALSE AND notes ILIKE '%manually added by admin%';
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS waitlist (

@@ -1935,14 +1935,14 @@ function requireAdminKey(req, res, next) {
 // Admin overview: total customers, total storage, system health
 app.get('/admin/overview', requireAdminKey, async (req, res) => {
   try {
-    // "Customers" = actually paid (or comped by admin), not just anyone
-    // who filled out the signup form - matches LEADS_WHERE's definition
-    // below, just inverted. Guide-only buyers (no Bridge) are counted
-    // separately since they never get a missionaries row.
+    // "Customers" = actually paid or explicitly flagged is_comped (a
+    // real free account, e.g. friends & family) - matches LEADS_WHERE's
+    // definition below, just inverted. Guide-only buyers (no Bridge)
+    // are counted separately since they never get a missionaries row.
     const missionaryCount = await pool.query(`
       SELECT COUNT(*) FROM missionaries
       WHERE is_removed = FALSE
-        AND (COALESCE(paid_amount, 0) > 0 OR notes ILIKE '%manually added by admin%')
+        AND (COALESCE(paid_amount, 0) > 0 OR COALESCE(is_comped, FALSE) = TRUE)
     `);
     const guideOnlyCustomerCount = await pool.query(`
       SELECT COUNT(*) FROM guide_purchases WHERE paid_at IS NOT NULL AND missionary_id IS NULL
@@ -1960,7 +1960,7 @@ app.get('/admin/overview', requireAdminKey, async (req, res) => {
       SELECT COUNT(*) FROM missionaries
       WHERE COALESCE(paid_amount, 0) = 0
         AND is_removed = FALSE
-        AND (notes IS NULL OR notes NOT ILIKE '%manually added by admin%')
+        AND COALESCE(is_comped, FALSE) = FALSE
     `);
     const totalExpenditures = await pool.query(`SELECT COALESCE(SUM(amount), 0) as total FROM expenditures`);
     const totalAttachmentSize = await pool.query(`SELECT COALESCE(SUM(size_bytes), 0) as total FROM attachments WHERE is_deleted = FALSE`);
@@ -2022,7 +2022,7 @@ app.get('/admin/customers', requireAdminKey, async (req, res) => {
   try {
     const missionaries = await pool.query(`
       SELECT * FROM missionaries
-      WHERE COALESCE(paid_amount, 0) > 0 OR notes ILIKE '%manually added by admin%'
+      WHERE COALESCE(paid_amount, 0) > 0 OR COALESCE(is_comped, FALSE) = TRUE
       ORDER BY created_at DESC
     `);
 
@@ -2057,6 +2057,7 @@ app.get('/admin/customers', requireAdminKey, async (req, res) => {
           id: m.id,
           customerType: 'bridge',
           boughtPhotoGuide: guideAddOnIds.has(m.id),
+          isComped: m.is_comped || false,
           missionaryName: m.missionary_name,
           missionaryEmail: m.missionary_email,
           familyEmail: m.family_email,
@@ -2116,14 +2117,13 @@ app.get('/admin/customers', requireAdminKey, async (req, res) => {
 // Leads: signups that never completed payment. A row shows up here the
 // moment the signup form is submitted - paid_amount stays 0 until the
 // Stripe webhook confirms a real charge - and drops off on its own
-// once paid_amount > 0. Manually-added comped accounts (created via
-// /admin/customers/manual, which always appends "Manually added by
-// admin" to notes) are filtered out here: they're real customers, not
-// unconverted leads.
+// once paid_amount > 0. Anything flagged is_comped (a real free
+// account - friends & family, a comped customer, etc.) is filtered out
+// here: it's a real customer, not an unconverted lead.
 const LEADS_WHERE = `
   COALESCE(paid_amount, 0) = 0
   AND is_removed = FALSE
-  AND (notes IS NULL OR notes NOT ILIKE '%manually added by admin%')
+  AND COALESCE(is_comped, FALSE) = FALSE
 `;
 
 app.get('/admin/leads', requireAdminKey, async (req, res) => {
@@ -2160,10 +2160,14 @@ app.get('/admin/leads', requireAdminKey, async (req, res) => {
 // customers), this doesn't require typed email confirmation since
 // there's no paid relationship to protect - but the WHERE clause still
 // only ever matches a row that currently qualifies as a lead, so this
-// can't be pointed at a real customer just by guessing an id. Also
-// cleans up any emails/attachments that arrived before checkout was
-// ever finished, so nothing is left orphaned pointing at a
-// missionary_email that no longer exists.
+// can't be pointed at a real customer just by guessing an id. As a
+// second safety net, it also refuses to touch a row that has any real
+// captured emails - a genuinely abandoned checkout never got that far,
+// so any inbound mail on file means this address actually saw use and
+// belongs behind the deliberate, typed-confirmation delete-forever
+// flow instead. Also cleans up any attachments that arrived before
+// checkout was ever finished, so nothing is left orphaned pointing at
+// a missionary_email that no longer exists.
 app.delete('/admin/leads/:id', requireAdminKey, async (req, res) => {
   try {
     const result = await pool.query(
@@ -2176,20 +2180,19 @@ app.delete('/admin/leads/:id', requireAdminKey, async (req, res) => {
     }
 
     if (m.missionary_email) {
-      const attachmentsResult = await pool.query(
-        `SELECT a.saved_as FROM attachments a
-         JOIN emails e ON a.email_id = e.id
-         WHERE e.sender_email = $1`,
+      const emailCount = await pool.query(
+        `SELECT COUNT(*) FROM emails WHERE sender_email = $1`,
         [m.missionary_email]
       );
-      for (const row of attachmentsResult.rows) {
-        try {
-          await deleteFromR2(row.saved_as);
-        } catch (err) {
-          console.error(`Error deleting R2 file ${row.saved_as}:`, err.message);
-        }
+      if (parseInt(emailCount.rows[0].count, 10) > 0) {
+        return res.status(409).json({
+          error: 'This address has real captured emails on file, so it does not look like an abandoned lead. Use "Delete forever" from the Customers tab instead if you really mean to erase it.',
+        });
       }
-      await pool.query(`DELETE FROM emails WHERE sender_email = $1`, [m.missionary_email]);
+
+      // No captured emails means no attachments either (attachments
+      // always belong to an email row), so there's nothing in R2 to
+      // clean up here - just any dashboard view history.
       await pool.query(`DELETE FROM dashboard_views WHERE LOWER(missionary_email) = $1`, [m.missionary_email.toLowerCase()]);
     }
 
@@ -2228,15 +2231,22 @@ app.post('/admin/leads/:id/reachout', requireAdminKey, async (req, res) => {
 // Admin: update a customer's paid amount or notes
 app.post('/admin/customers/:id', requireAdminKey, async (req, res) => {
   try {
-    const { paidAmount, notes, missionaryEmail, familyEmail } = req.body;
+    const { paidAmount, notes, missionaryEmail, familyEmail, isComped } = req.body;
     await pool.query(
       `UPDATE missionaries SET
          paid_amount = COALESCE($1, paid_amount),
          notes = COALESCE($2, notes),
          missionary_email = COALESCE(NULLIF($3, ''), missionary_email),
-         family_email = COALESCE(NULLIF($4, ''), family_email)
-       WHERE id = $5`,
-      [paidAmount, notes, missionaryEmail ? sanitizeMissionaryEmail(missionaryEmail) : null, familyEmail ? familyEmail.toLowerCase().trim() : null, req.params.id]
+         family_email = COALESCE(NULLIF($4, ''), family_email),
+         is_comped = COALESCE($5, is_comped)
+       WHERE id = $6`,
+      [
+        paidAmount, notes,
+        missionaryEmail ? sanitizeMissionaryEmail(missionaryEmail) : null,
+        familyEmail ? familyEmail.toLowerCase().trim() : null,
+        typeof isComped === 'boolean' ? isComped : null,
+        req.params.id,
+      ]
     );
     res.json({ success: true });
   } catch (err) {
