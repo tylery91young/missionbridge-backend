@@ -2012,6 +2012,48 @@ app.get('/admin/overview', requireAdminKey, async (req, res) => {
   }
 });
 
+// Diagnostic: raw, unfiltered lookup by email - shows the actual
+// underlying row (paid_amount, is_removed, is_comped, real captured
+// email count) regardless of whether it would currently show up in
+// Customers or Leads. Built after an incident where a row could be
+// invisible in BOTH tabs at once (is_removed=TRUE stops it appearing
+// in Leads; paid_amount=0 and is_comped=FALSE stops it appearing in
+// Customers) - existing admin views are always filtered, so this is
+// the only way to see ground truth for one specific person.
+app.get('/admin/lookup', requireAdminKey, async (req, res) => {
+  try {
+    const email = (req.query.email || '').toLowerCase().trim();
+    if (!email) {
+      return res.status(400).json({ error: 'email query param is required' });
+    }
+
+    const missionaries = await pool.query(
+      `SELECT * FROM missionaries WHERE LOWER(missionary_email) = $1 OR LOWER(family_email) = $1`,
+      [email]
+    );
+
+    const results = await Promise.all(missionaries.rows.map(async (m) => {
+      const emailCount = m.missionary_email
+        ? await pool.query(`SELECT COUNT(*) FROM emails WHERE sender_email = $1`, [m.missionary_email.toLowerCase()])
+        : { rows: [{ count: '0' }] };
+      const paidAmount = parseFloat(m.paid_amount || 0);
+      return {
+        ...m,
+        capturedEmailCount: parseInt(emailCount.rows[0].count, 10),
+        wouldShowInCustomers: paidAmount > 0 || !!m.is_comped,
+        wouldShowInLeads: paidAmount === 0 && !m.is_removed && !m.is_comped,
+      };
+    }));
+
+    const guidePurchases = await pool.query(`SELECT * FROM guide_purchases WHERE LOWER(email) = $1`, [email]);
+
+    res.json({ missionaries: results, guidePurchases: guidePurchases.rows });
+  } catch (err) {
+    console.error('Error in admin lookup:', err);
+    res.status(500).json({ error: 'Error looking up email' });
+  }
+});
+
 // Admin customer list: everyone who's actually paid (or was manually
 // comped), with their usage stats. Someone who filled out the signup
 // form but never finished Stripe checkout stays a "lead" (see below)
