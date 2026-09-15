@@ -2028,26 +2028,41 @@ app.get('/admin/lookup', requireAdminKey, async (req, res) => {
     }
 
     const missionaries = await pool.query(
-      `SELECT * FROM missionaries WHERE LOWER(missionary_email) = $1 OR LOWER(family_email) = $1`,
+      `SELECT * FROM missionaries WHERE LOWER(TRIM(missionary_email)) = $1 OR LOWER(TRIM(family_email)) = $1`,
       [email]
     );
 
-    const results = await Promise.all(missionaries.rows.map(async (m) => {
-      const emailCount = m.missionary_email
-        ? await pool.query(`SELECT COUNT(*) FROM emails WHERE sender_email = $1`, [m.missionary_email.toLowerCase()])
-        : { rows: [{ count: '0' }] };
+    const results = missionaries.rows.map(m => {
       const paidAmount = parseFloat(m.paid_amount || 0);
       return {
         ...m,
-        capturedEmailCount: parseInt(emailCount.rows[0].count, 10),
         wouldShowInCustomers: paidAmount > 0 || !!m.is_comped,
         wouldShowInLeads: paidAmount === 0 && !m.is_removed && !m.is_comped,
       };
-    }));
+    });
 
-    const guidePurchases = await pool.query(`SELECT * FROM guide_purchases WHERE LOWER(email) = $1`, [email]);
+    // Checked directly against the emails table by the address itself,
+    // not through a found missionaries row - so this still tells the
+    // truth even if that row was deleted (emails.sender_email isn't a
+    // foreign key, so orphaned rows would survive that on their own).
+    const capturedEmails = await pool.query(
+      `SELECT id, subject, received_at, is_deleted FROM emails WHERE LOWER(TRIM(sender_email)) = $1 ORDER BY received_at DESC`,
+      [email]
+    );
+    const emailIds = capturedEmails.rows.map(e => e.id);
+    const attachmentCount = emailIds.length
+      ? await pool.query(`SELECT COUNT(*) FROM attachments WHERE email_id = ANY($1)`, [emailIds])
+      : { rows: [{ count: '0' }] };
 
-    res.json({ missionaries: results, guidePurchases: guidePurchases.rows });
+    const guidePurchases = await pool.query(`SELECT * FROM guide_purchases WHERE LOWER(TRIM(email)) = $1`, [email]);
+
+    res.json({
+      missionaries: results,
+      capturedEmails: capturedEmails.rows,
+      capturedEmailCount: capturedEmails.rows.length,
+      attachmentCount: parseInt(attachmentCount.rows[0].count, 10),
+      guidePurchases: guidePurchases.rows,
+    });
   } catch (err) {
     console.error('Error in admin lookup:', err);
     res.status(500).json({ error: 'Error looking up email' });
