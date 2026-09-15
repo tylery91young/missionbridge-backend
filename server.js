@@ -2289,6 +2289,106 @@ app.post('/admin/leads/:id/reachout', requireAdminKey, async (req, res) => {
   }
 });
 
+// Admin: manually create a customer record directly, bypassing Stripe
+// entirely - for comped/free accounts or a custom reduced price Tyler
+// arranges personally (e.g. a ward member, a founding tester). Unlike
+// the public /signup form, paid_amount is set directly here since
+// there may be no Stripe charge at all. Still runs through the same
+// hijack guard, dashboard-token generation, referral-code generation,
+// and onboarding-email path a real Stripe signup gets, so a comped
+// customer isn't a second-class experience.
+app.post('/admin/customers/manual', requireAdminKey, async (req, res) => {
+  try {
+    const {
+      missionaryName, missionaryEmail, familyEmail, familyPhone,
+      expectedReturnDate, missionStartDate, missionStatus,
+      paidAmount, notes, sendEmails, secondaryEmail, dashboardToken: requestedToken,
+    } = req.body;
+
+    if (!missionaryEmail || !familyEmail) {
+      return res.status(400).json({ error: 'Missionary email and family email are both required' });
+    }
+
+    const cleanMissionaryEmail = sanitizeMissionaryEmail(missionaryEmail);
+    const cleanFamilyEmail = familyEmail.toLowerCase().trim();
+    const cleanSecondaryEmail = secondaryEmail ? secondaryEmail.toLowerCase().trim() : null;
+
+    const existing = await pool.query(
+      `SELECT id, paid_amount FROM missionaries WHERE missionary_email = $1`,
+      [cleanMissionaryEmail]
+    );
+    if (existing.rows[0] && parseFloat(existing.rows[0].paid_amount || 0) > 0) {
+      return res.status(409).json({ error: 'This missionary already has an active account.' });
+    }
+
+    const dashboardToken = (requestedToken && requestedToken.trim()) || crypto.randomBytes(24).toString('hex');
+    const amount = (paidAmount !== undefined && paidAmount !== null && paidAmount !== '') ? parseFloat(paidAmount) : 0;
+    const combinedNotes = [notes && notes.trim(), 'Manually added by admin'].filter(Boolean).join(' — ');
+
+    // Anything created through this deliberate admin flow is by
+    // definition a real account, not an abandoned lead - is_comped is
+    // set TRUE unconditionally (not just when the amount is $0) so it
+    // can never again be mistaken for a lead regardless of what the
+    // Paid amount gets edited to later.
+    let result;
+    try {
+      result = await pool.query(
+        `INSERT INTO missionaries (missionary_email, missionary_name, family_email, family_phone, expected_return_date, mission_start_date, mission_status, paid_amount, notes, dashboard_token, is_comped, secondary_sender_email)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, $11)
+         ON CONFLICT (missionary_email) DO UPDATE SET
+           family_email = $3, missionary_name = $2, family_phone = $4, expected_return_date = $5,
+           mission_start_date = $6, mission_status = $7, paid_amount = $8, notes = $9,
+           dashboard_token = COALESCE(missionaries.dashboard_token, $10), is_comped = TRUE,
+           secondary_sender_email = COALESCE($11, missionaries.secondary_sender_email)
+         RETURNING *`,
+        [
+          cleanMissionaryEmail, missionaryName || null, cleanFamilyEmail, familyPhone || null,
+          expectedReturnDate || null, missionStartDate || null, missionStatus || 'serving',
+          amount, combinedNotes, dashboardToken, cleanSecondaryEmail,
+        ]
+      );
+    } catch (err) {
+      if (err.code === '23505' && err.constraint && err.constraint.includes('dashboard_token')) {
+        return res.status(409).json({ error: 'That dashboard token is already in use by another account.' });
+      }
+      throw err;
+    }
+
+    const m = result.rows[0];
+
+    let referralCode = null;
+    try {
+      referralCode = await ensureReferralCode(m);
+    } catch (refErr) {
+      console.error('Error generating referral code for manually-added customer:', refErr.message);
+    }
+
+    if (sendEmails) {
+      try {
+        await sendSignupEmails({
+          missionaryEmail: m.missionary_email, missionaryName: m.missionary_name, familyEmail: m.family_email,
+          missionStartDate: m.mission_start_date, missionStatus: m.mission_status,
+          dashboardToken: m.dashboard_token, referralCode,
+        });
+      } catch (mailErr) {
+        console.error('Error sending onboarding emails for manually-added customer:', mailErr.message);
+      }
+    }
+
+    res.status(200).json({
+      id: m.id,
+      missionaryEmail: m.missionary_email,
+      familyEmail: m.family_email,
+      paidAmount: parseFloat(m.paid_amount || 0),
+      dashboardUrl: `https://getmissionbridge.com/dashboard.html?token=${dashboardToken}`,
+      referralCode,
+    });
+  } catch (err) {
+    console.error('Error manually creating customer:', err);
+    res.status(500).json({ error: 'Something went wrong creating this customer' });
+  }
+});
+
 // Admin: update a customer's paid amount or notes
 app.post('/admin/customers/:id', requireAdminKey, async (req, res) => {
   try {
@@ -2778,105 +2878,6 @@ app.delete('/admin/todos/:id', requireAdminKey, async (req, res) => {
   }
 });
 
-// Admin: manually create a customer record directly, bypassing Stripe
-// entirely - for comped/free accounts or a custom reduced price Tyler
-// arranges personally (e.g. a ward member, a founding tester). Unlike
-// the public /signup form, paid_amount is set directly here since
-// there may be no Stripe charge at all. Still runs through the same
-// hijack guard, dashboard-token generation, referral-code generation,
-// and onboarding-email path a real Stripe signup gets, so a comped
-// customer isn't a second-class experience.
-app.post('/admin/customers/manual', requireAdminKey, async (req, res) => {
-  try {
-    const {
-      missionaryName, missionaryEmail, familyEmail, familyPhone,
-      expectedReturnDate, missionStartDate, missionStatus,
-      paidAmount, notes, sendEmails, secondaryEmail, dashboardToken: requestedToken,
-    } = req.body;
-
-    if (!missionaryEmail || !familyEmail) {
-      return res.status(400).json({ error: 'Missionary email and family email are both required' });
-    }
-
-    const cleanMissionaryEmail = sanitizeMissionaryEmail(missionaryEmail);
-    const cleanFamilyEmail = familyEmail.toLowerCase().trim();
-    const cleanSecondaryEmail = secondaryEmail ? secondaryEmail.toLowerCase().trim() : null;
-
-    const existing = await pool.query(
-      `SELECT id, paid_amount FROM missionaries WHERE missionary_email = $1`,
-      [cleanMissionaryEmail]
-    );
-    if (existing.rows[0] && parseFloat(existing.rows[0].paid_amount || 0) > 0) {
-      return res.status(409).json({ error: 'This missionary already has an active account.' });
-    }
-
-    const dashboardToken = (requestedToken && requestedToken.trim()) || crypto.randomBytes(24).toString('hex');
-    const amount = (paidAmount !== undefined && paidAmount !== null && paidAmount !== '') ? parseFloat(paidAmount) : 0;
-    const combinedNotes = [notes && notes.trim(), 'Manually added by admin'].filter(Boolean).join(' — ');
-
-    // Anything created through this deliberate admin flow is by
-    // definition a real account, not an abandoned lead - is_comped is
-    // set TRUE unconditionally (not just when the amount is $0) so it
-    // can never again be mistaken for a lead regardless of what the
-    // Paid amount gets edited to later.
-    let result;
-    try {
-      result = await pool.query(
-        `INSERT INTO missionaries (missionary_email, missionary_name, family_email, family_phone, expected_return_date, mission_start_date, mission_status, paid_amount, notes, dashboard_token, is_comped, secondary_sender_email)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, $11)
-         ON CONFLICT (missionary_email) DO UPDATE SET
-           family_email = $3, missionary_name = $2, family_phone = $4, expected_return_date = $5,
-           mission_start_date = $6, mission_status = $7, paid_amount = $8, notes = $9,
-           dashboard_token = COALESCE(missionaries.dashboard_token, $10), is_comped = TRUE,
-           secondary_sender_email = COALESCE($11, missionaries.secondary_sender_email)
-         RETURNING *`,
-        [
-          cleanMissionaryEmail, missionaryName || null, cleanFamilyEmail, familyPhone || null,
-          expectedReturnDate || null, missionStartDate || null, missionStatus || 'serving',
-          amount, combinedNotes, dashboardToken, cleanSecondaryEmail,
-        ]
-      );
-    } catch (err) {
-      if (err.code === '23505' && err.constraint && err.constraint.includes('dashboard_token')) {
-        return res.status(409).json({ error: 'That dashboard token is already in use by another account.' });
-      }
-      throw err;
-    }
-
-    const m = result.rows[0];
-
-    let referralCode = null;
-    try {
-      referralCode = await ensureReferralCode(m);
-    } catch (refErr) {
-      console.error('Error generating referral code for manually-added customer:', refErr.message);
-    }
-
-    if (sendEmails) {
-      try {
-        await sendSignupEmails({
-          missionaryEmail: m.missionary_email, missionaryName: m.missionary_name, familyEmail: m.family_email,
-          missionStartDate: m.mission_start_date, missionStatus: m.mission_status,
-          dashboardToken: m.dashboard_token, referralCode,
-        });
-      } catch (mailErr) {
-        console.error('Error sending onboarding emails for manually-added customer:', mailErr.message);
-      }
-    }
-
-    res.status(200).json({
-      id: m.id,
-      missionaryEmail: m.missionary_email,
-      familyEmail: m.family_email,
-      paidAmount: parseFloat(m.paid_amount || 0),
-      dashboardUrl: `https://getmissionbridge.com/dashboard.html?token=${dashboardToken}`,
-      referralCode,
-    });
-  } catch (err) {
-    console.error('Error manually creating customer:', err);
-    res.status(500).json({ error: 'Something went wrong creating this customer' });
-  }
-});
 
 // Public: short difficulty/problems form shown after someone finishes
 // the Photo Save Guide. The guide's real-world accuracy hasn't been
