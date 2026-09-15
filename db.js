@@ -388,6 +388,27 @@ async function initDb() {
   await pool.query(`
     ALTER TABLE guide_purchases ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;
   `);
+  // One-time backfill for rows created before paid_at existed - real
+  // buyers from before this column was added would otherwise look
+  // unpaid forever and silently vanish from admin customer/revenue
+  // totals. The "Your Photo Save Guide is ready" confirmation email
+  // (email_type 'guide_purchase_confirmation') only ever sends from
+  // inside the Stripe webhook after payment is confirmed, and mailer.js
+  // logs every send attempt to email_log regardless of outcome - so a
+  // matching log row is the best signal available for historical data.
+  // Only touches rows still NULL, so this is a no-op on every boot
+  // after the first.
+  await pool.query(`
+    UPDATE guide_purchases gp
+    SET paid_at = sub.first_sent_at
+    FROM (
+      SELECT LOWER(recipient) AS recipient, MIN(sent_at) AS first_sent_at
+      FROM email_log
+      WHERE email_type = 'guide_purchase_confirmation'
+      GROUP BY LOWER(recipient)
+    ) sub
+    WHERE gp.paid_at IS NULL AND LOWER(gp.email) = sub.recipient;
+  `);
 
   // Short difficulty/problems form shown after someone finishes the
   // Photo Save Guide - the guide's real-world accuracy hasn't been
