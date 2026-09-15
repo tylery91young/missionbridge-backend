@@ -669,11 +669,14 @@ app.post('/webhook', upload.any(), async (req, res) => {
     const cleanFromAddress = (emailMatch ? emailMatch[1] : from).toLowerCase().trim();
 
     // Look up which missionary this email belongs to, if registered.
-    // Matches either the missionary's own address OR the family's -
-    // lets a parent forward past updates to catch up on anything sent
-    // before signup, not just the missionary sending directly.
+    // Matches the missionary's own address, the family's, or a
+    // one-off secondary_sender_email (e.g. someone else forwarding a
+    // batch of already-lost history on the family's behalf from their
+    // own inbox) - lets anyone registered forward past updates to
+    // catch up on anything sent before signup, not just the
+    // missionary sending directly.
     const missionaryLookup = await pool.query(
-      `SELECT * FROM missionaries WHERE missionary_email = $1 OR family_email = $1`,
+      `SELECT * FROM missionaries WHERE missionary_email = $1 OR family_email = $1 OR LOWER(secondary_sender_email) = $1`,
       [cleanFromAddress]
     );
     const missionary = missionaryLookup.rows[0] || null;
@@ -2288,25 +2291,32 @@ app.post('/admin/leads/:id/reachout', requireAdminKey, async (req, res) => {
 // Admin: update a customer's paid amount or notes
 app.post('/admin/customers/:id', requireAdminKey, async (req, res) => {
   try {
-    const { paidAmount, notes, missionaryEmail, familyEmail, isComped } = req.body;
+    const { paidAmount, notes, missionaryEmail, familyEmail, isComped, secondaryEmail, dashboardToken } = req.body;
     await pool.query(
       `UPDATE missionaries SET
          paid_amount = COALESCE($1, paid_amount),
          notes = COALESCE($2, notes),
          missionary_email = COALESCE(NULLIF($3, ''), missionary_email),
          family_email = COALESCE(NULLIF($4, ''), family_email),
-         is_comped = COALESCE($5, is_comped)
-       WHERE id = $6`,
+         is_comped = COALESCE($5, is_comped),
+         secondary_sender_email = COALESCE(NULLIF($6, ''), secondary_sender_email),
+         dashboard_token = COALESCE(NULLIF($7, ''), dashboard_token)
+       WHERE id = $8`,
       [
         paidAmount, notes,
         missionaryEmail ? sanitizeMissionaryEmail(missionaryEmail) : null,
         familyEmail ? familyEmail.toLowerCase().trim() : null,
         typeof isComped === 'boolean' ? isComped : null,
+        secondaryEmail ? secondaryEmail.toLowerCase().trim() : null,
+        dashboardToken ? dashboardToken.trim() : null,
         req.params.id,
       ]
     );
     res.json({ success: true });
   } catch (err) {
+    if (err.code === '23505' && err.constraint && err.constraint.includes('dashboard_token')) {
+      return res.status(409).json({ error: 'That dashboard token is already in use by another account.' });
+    }
     console.error('Error updating customer:', err);
     res.status(500).json({ error: 'Error updating customer' });
   }

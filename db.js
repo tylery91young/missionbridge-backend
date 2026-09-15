@@ -176,6 +176,14 @@ async function initDb() {
     UPDATE missionaries SET is_comped = TRUE
     WHERE COALESCE(is_comped, FALSE) = FALSE AND notes ILIKE '%manually added by admin%';
   `);
+  // One extra address allowed to forward mail on this missionary's
+  // behalf, in addition to their own address and the family's - e.g.
+  // Tyler forwarding a batch of already-lost history from his own
+  // inbox to help a family catch back up. Checked in the inbound
+  // webhook's sender lookup alongside missionary_email/family_email.
+  await pool.query(`
+    ALTER TABLE missionaries ADD COLUMN IF NOT EXISTS secondary_sender_email TEXT;
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS waitlist (
