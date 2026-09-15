@@ -184,6 +184,16 @@ async function initDb() {
   await pool.query(`
     ALTER TABLE missionaries ADD COLUMN IF NOT EXISTS secondary_sender_email TEXT;
   `);
+  // "Dismiss" a lead from the Leads list without ever touching its
+  // row, emails, or attachments - after an incident where a real
+  // customer's account (and its captured emails) was permanently lost
+  // to a single click on what used to be a real DELETE, this is now
+  // the only thing that button does. Real, permanent erasure stays
+  // exclusively behind the customer-facing "Delete forever" flow,
+  // which requires typing the exact email address as confirmation.
+  await pool.query(`
+    ALTER TABLE missionaries ADD COLUMN IF NOT EXISTS lead_dismissed_at TIMESTAMPTZ;
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS waitlist (

@@ -2180,11 +2180,14 @@ app.get('/admin/customers', requireAdminKey, async (req, res) => {
 // Stripe webhook confirms a real charge - and drops off on its own
 // once paid_amount > 0. Anything flagged is_comped (a real free
 // account - friends & family, a comped customer, etc.) is filtered out
-// here: it's a real customer, not an unconverted lead.
+// here: it's a real customer, not an unconverted lead. Dismissed leads
+// (see DELETE below - a soft, reversible hide, not a real delete) are
+// filtered out too.
 const LEADS_WHERE = `
   COALESCE(paid_amount, 0) = 0
   AND is_removed = FALSE
   AND COALESCE(is_comped, FALSE) = FALSE
+  AND lead_dismissed_at IS NULL
 `;
 
 app.get('/admin/leads', requireAdminKey, async (req, res) => {
@@ -2216,19 +2219,49 @@ app.get('/admin/leads', requireAdminKey, async (req, res) => {
   }
 });
 
-// Permanently remove a lead - someone who filled out the signup form
-// but never finished payment. Unlike delete-forever (real, paying
-// customers), this doesn't require typed email confirmation since
-// there's no paid relationship to protect - but the WHERE clause still
-// only ever matches a row that currently qualifies as a lead, so this
-// can't be pointed at a real customer just by guessing an id. As a
-// second safety net, it also refuses to touch a row that has any real
-// captured emails - a genuinely abandoned checkout never got that far,
-// so any inbound mail on file means this address actually saw use and
-// belongs behind the deliberate, typed-confirmation delete-forever
-// flow instead. Also cleans up any attachments that arrived before
-// checkout was ever finished, so nothing is left orphaned pointing at
-// a missionary_email that no longer exists.
+// Dismissed leads - hidden from the main Leads list but NOT deleted,
+// so a wrong dismissal can always be undone. Separate endpoint rather
+// than a query param on /admin/leads to keep that route's default
+// response exactly what it always was.
+app.get('/admin/leads/dismissed', requireAdminKey, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT id, missionary_name, missionary_email, family_email, family_phone, notes, created_at, lead_dismissed_at
+      FROM missionaries
+      WHERE lead_dismissed_at IS NOT NULL
+        AND COALESCE(paid_amount, 0) = 0
+        AND COALESCE(is_comped, FALSE) = FALSE
+      ORDER BY lead_dismissed_at DESC
+    `);
+    res.json(result.rows.map(m => ({
+      id: m.id,
+      missionaryName: m.missionary_name,
+      missionaryEmail: m.missionary_email,
+      familyEmail: m.family_email,
+      familyPhone: m.family_phone,
+      notes: m.notes,
+      filledOutAt: m.created_at,
+      dismissedAt: m.lead_dismissed_at,
+    })));
+  } catch (err) {
+    console.error('Error building dismissed leads list:', err);
+    res.status(500).json({ error: 'Error fetching dismissed leads' });
+  }
+});
+
+// Removes a lead from the Leads list - since the incident where a real
+// customer's account (and its 10 captured emails) was permanently
+// erased by a single click here, this NEVER deletes anything anymore.
+// It only stamps lead_dismissed_at, which LEADS_WHERE filters out -
+// the row, and any emails/attachments it might have, are left
+// completely untouched and can be brought back at any time via the
+// restore endpoint below. The WHERE clause still only ever matches a
+// row that currently qualifies as a lead, so this can't be pointed at
+// a real customer just by guessing an id. Real, permanent erasure
+// stays exclusively behind the customer-facing "Delete forever" flow,
+// which requires typing the exact email address as confirmation - as
+// an extra nudge toward that deliberate path, this also warns (but no
+// longer blocks) when the address has real captured emails on file.
 app.delete('/admin/leads/:id', requireAdminKey, async (req, res) => {
   try {
     const result = await pool.query(
@@ -2240,29 +2273,43 @@ app.delete('/admin/leads/:id', requireAdminKey, async (req, res) => {
       return res.status(404).json({ error: 'Lead not found - it may have already paid or been removed' });
     }
 
+    let hasRealEmails = false;
     if (m.missionary_email) {
       const emailCount = await pool.query(
         `SELECT COUNT(*) FROM emails WHERE sender_email = $1`,
         [m.missionary_email]
       );
-      if (parseInt(emailCount.rows[0].count, 10) > 0) {
-        return res.status(409).json({
-          error: 'This address has real captured emails on file, so it does not look like an abandoned lead. Use "Delete forever" from the Customers tab instead if you really mean to erase it.',
-        });
-      }
-
-      // No captured emails means no attachments either (attachments
-      // always belong to an email row), so there's nothing in R2 to
-      // clean up here - just any dashboard view history.
-      await pool.query(`DELETE FROM dashboard_views WHERE LOWER(missionary_email) = $1`, [m.missionary_email.toLowerCase()]);
+      hasRealEmails = parseInt(emailCount.rows[0].count, 10) > 0;
     }
 
-    await pool.query(`DELETE FROM missionaries WHERE id = $1`, [req.params.id]);
-    console.log(`Deleted lead #${req.params.id} (${m.missionary_email || m.family_email})`);
+    await pool.query(`UPDATE missionaries SET lead_dismissed_at = NOW() WHERE id = $1`, [req.params.id]);
+    console.log(`Dismissed lead #${req.params.id} (${m.missionary_email || m.family_email}) - nothing deleted`);
+    res.json({
+      success: true,
+      warning: hasRealEmails
+        ? 'Heads up: this address has real captured emails on file, so it may not actually be an abandoned lead. It has only been hidden, not deleted - restore it from "Recently dismissed" if this was a mistake.'
+        : null,
+    });
+  } catch (err) {
+    console.error('Error dismissing lead:', err);
+    res.status(500).json({ error: 'Error dismissing lead' });
+  }
+});
+
+// Undo a dismissal - brings a lead straight back to the main list.
+app.post('/admin/leads/:id/restore', requireAdminKey, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE missionaries SET lead_dismissed_at = NULL WHERE id = $1 AND lead_dismissed_at IS NOT NULL RETURNING id`,
+      [req.params.id]
+    );
+    if (!result.rows[0]) {
+      return res.status(404).json({ error: 'That lead was not found in the dismissed list' });
+    }
     res.json({ success: true });
   } catch (err) {
-    console.error('Error deleting lead:', err);
-    res.status(500).json({ error: 'Error deleting lead' });
+    console.error('Error restoring dismissed lead:', err);
+    res.status(500).json({ error: 'Error restoring lead' });
   }
 });
 
