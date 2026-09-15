@@ -2802,13 +2802,18 @@ app.post('/admin/customers/manual', requireAdminKey, async (req, res) => {
     const amount = (paidAmount !== undefined && paidAmount !== null && paidAmount !== '') ? parseFloat(paidAmount) : 0;
     const combinedNotes = [notes && notes.trim(), 'Manually added by admin'].filter(Boolean).join(' — ');
 
+    // Anything created through this deliberate admin flow is by
+    // definition a real account, not an abandoned lead - is_comped is
+    // set TRUE unconditionally (not just when the amount is $0) so it
+    // can never again be mistaken for a lead regardless of what the
+    // Paid amount gets edited to later.
     const result = await pool.query(
-      `INSERT INTO missionaries (missionary_email, missionary_name, family_email, family_phone, expected_return_date, mission_start_date, mission_status, paid_amount, notes, dashboard_token)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      `INSERT INTO missionaries (missionary_email, missionary_name, family_email, family_phone, expected_return_date, mission_start_date, mission_status, paid_amount, notes, dashboard_token, is_comped)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE)
        ON CONFLICT (missionary_email) DO UPDATE SET
          family_email = $3, missionary_name = $2, family_phone = $4, expected_return_date = $5,
          mission_start_date = $6, mission_status = $7, paid_amount = $8, notes = $9,
-         dashboard_token = COALESCE(missionaries.dashboard_token, $10)
+         dashboard_token = COALESCE(missionaries.dashboard_token, $10), is_comped = TRUE
        RETURNING *`,
       [
         cleanMissionaryEmail, missionaryName || null, cleanFamilyEmail, familyPhone || null,
