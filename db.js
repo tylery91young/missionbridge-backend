@@ -379,6 +379,16 @@ async function initDb() {
     );
   `);
 
+  // The row above is created up front, at checkout time, same "create
+  // now, confirm via webhook" pattern as missionaries - so paid_amount
+  // alone doesn't mean the charge actually went through. paid_at is
+  // only set once the Stripe webhook confirms checkout.session.completed,
+  // which is what admin views use to tell a real purchase from an
+  // abandoned checkout.
+  await pool.query(`
+    ALTER TABLE guide_purchases ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;
+  `);
+
   // Short difficulty/problems form shown after someone finishes the
   // Photo Save Guide - the guide's real-world accuracy hasn't been
   // independently verified yet, so this is how actual usage feedback

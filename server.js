@@ -484,7 +484,10 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
     // for the Bridge's own onboarding emails.
     if (guidePurchaseId) {
       try {
-        const guideResult = await pool.query(`SELECT * FROM guide_purchases WHERE id = $1`, [guidePurchaseId]);
+        const guideResult = await pool.query(
+          `UPDATE guide_purchases SET paid_at = COALESCE(paid_at, NOW()) WHERE id = $1 RETURNING *`,
+          [guidePurchaseId]
+        );
         const purchase = guideResult.rows[0];
         if (purchase && purchase.access_token) {
           const guideUrl = `https://getmissionbridge.com/photo-guide.html?token=${purchase.access_token}`;
@@ -1932,9 +1935,27 @@ function requireAdminKey(req, res, next) {
 // Admin overview: total customers, total storage, system health
 app.get('/admin/overview', requireAdminKey, async (req, res) => {
   try {
-    const missionaryCount = await pool.query(`SELECT COUNT(*) FROM missionaries WHERE is_removed = FALSE`);
+    // "Customers" = actually paid (or comped by admin), not just anyone
+    // who filled out the signup form - matches LEADS_WHERE's definition
+    // below, just inverted. Guide-only buyers (no Bridge) are counted
+    // separately since they never get a missionaries row.
+    const missionaryCount = await pool.query(`
+      SELECT COUNT(*) FROM missionaries
+      WHERE is_removed = FALSE
+        AND (COALESCE(paid_amount, 0) > 0 OR notes ILIKE '%manually added by admin%')
+    `);
+    const guideOnlyCustomerCount = await pool.query(`
+      SELECT COUNT(*) FROM guide_purchases WHERE paid_at IS NOT NULL AND missionary_id IS NULL
+    `);
     const totalRevenue = await pool.query(`SELECT COALESCE(SUM(paid_amount), 0) as total FROM missionaries`);
+    const guideRevenue = await pool.query(`SELECT COALESCE(SUM(paid_amount), 0) as total FROM guide_purchases WHERE paid_at IS NOT NULL`);
     const paidCustomerCount = await pool.query(`SELECT COUNT(*) FROM missionaries WHERE paid_amount > 0`);
+    // Only non-bundled guide purchases, so a bundle checkout (Bridge +
+    // guide in one Stripe charge) doesn't get its flat $0.30 fee
+    // counted twice - the bundled ones are already in paidCustomerCount.
+    const guideOnlyPaidCount = await pool.query(`
+      SELECT COUNT(*) FROM guide_purchases WHERE paid_at IS NOT NULL AND bridge_added_on = FALSE
+    `);
     const openLeadsCount = await pool.query(`
       SELECT COUNT(*) FROM missionaries
       WHERE COALESCE(paid_amount, 0) = 0
@@ -1956,14 +1977,15 @@ app.get('/admin/overview', requireAdminKey, async (req, res) => {
     // Estimated, not exact - Stripe's real per-transaction fee isn't
     // stored anywhere (would need pulling each charge's balance
     // transaction from the Stripe API), so this approximates the
-    // standard 2.9% + $0.30 rate against actual paid transactions,
-    // just so "net profit" isn't quietly overstated.
-    const revenueTotal = parseFloat(totalRevenue.rows[0].total);
-    const paidCount = parseInt(paidCustomerCount.rows[0].count, 10);
+    // standard 2.9% + $0.30 rate against actual paid transactions
+    // (Bridge + standalone guide purchases), just so "net profit"
+    // isn't quietly overstated.
+    const revenueTotal = parseFloat(totalRevenue.rows[0].total) + parseFloat(guideRevenue.rows[0].total);
+    const paidCount = parseInt(paidCustomerCount.rows[0].count, 10) + parseInt(guideOnlyPaidCount.rows[0].count, 10);
     const estimatedStripeFees = paidCount > 0 ? (revenueTotal * 0.029) + (paidCount * 0.30) : 0;
 
     res.json({
-      totalCustomers: parseInt(missionaryCount.rows[0].count, 10),
+      totalCustomers: parseInt(missionaryCount.rows[0].count, 10) + parseInt(guideOnlyCustomerCount.rows[0].count, 10),
       openLeads: parseInt(openLeadsCount.rows[0].count, 10),
       totalRevenue: revenueTotal,
       totalExpenditures: parseFloat(totalExpenditures.rows[0].total),
@@ -1990,12 +2012,30 @@ app.get('/admin/overview', requireAdminKey, async (req, res) => {
   }
 });
 
-// Admin customer list: everyone signed up, with their usage stats
+// Admin customer list: everyone who's actually paid (or was manually
+// comped), with their usage stats. Someone who filled out the signup
+// form but never finished Stripe checkout stays a "lead" (see below)
+// and never shows up here. Photo Save Guide buyers who never added the
+// Bridge don't have a missionaries row at all, so they're merged in
+// separately below, tagged customerType: 'guide'.
 app.get('/admin/customers', requireAdminKey, async (req, res) => {
   try {
-    const missionaries = await pool.query(`SELECT * FROM missionaries ORDER BY created_at DESC`);
+    const missionaries = await pool.query(`
+      SELECT * FROM missionaries
+      WHERE COALESCE(paid_amount, 0) > 0 OR notes ILIKE '%manually added by admin%'
+      ORDER BY created_at DESC
+    `);
 
-    const customers = await Promise.all(
+    // Bridge customers who also bought the guide as a bundle add-on
+    // already have their own missionaries row (and show up above) -
+    // this just flags which ones, so the UI can note it without a
+    // second row for the same person.
+    const guideAddOns = await pool.query(
+      `SELECT missionary_id FROM guide_purchases WHERE paid_at IS NOT NULL AND missionary_id IS NOT NULL`
+    );
+    const guideAddOnIds = new Set(guideAddOns.rows.map(r => r.missionary_id));
+
+    const bridgeCustomers = await Promise.all(
       missionaries.rows.map(async (m) => {
         const emails = await pool.query(
           `SELECT id FROM emails WHERE sender_email = $1`,
@@ -2015,6 +2055,8 @@ app.get('/admin/customers', requireAdminKey, async (req, res) => {
 
         return {
           id: m.id,
+          customerType: 'bridge',
+          boughtPhotoGuide: guideAddOnIds.has(m.id),
           missionaryName: m.missionary_name,
           missionaryEmail: m.missionary_email,
           familyEmail: m.family_email,
@@ -2033,6 +2075,36 @@ app.get('/admin/customers', requireAdminKey, async (req, res) => {
         };
       })
     );
+
+    const guideOnly = await pool.query(`
+      SELECT * FROM guide_purchases
+      WHERE paid_at IS NOT NULL AND missionary_id IS NULL
+      ORDER BY created_at DESC
+    `);
+
+    const guideCustomers = guideOnly.rows.map(g => ({
+      id: `guide-${g.id}`,
+      customerType: 'guide',
+      boughtPhotoGuide: true,
+      missionaryName: g.name,
+      missionaryEmail: null,
+      familyEmail: g.email,
+      familyPhone: g.phone,
+      isRemoved: false,
+      expectedReturnDate: null,
+      paidAmount: parseFloat(g.paid_amount || 0),
+      notes: 'Photo Guide customer',
+      deletionRequestedAt: null,
+      cameHomeEarlyAt: null,
+      missionStartDate: null,
+      signedUpAt: g.created_at,
+      daysSinceSignup: Math.floor((Date.now() - new Date(g.created_at)) / (1000 * 60 * 60 * 24)),
+      totalUpdatesReceived: 0,
+      storageUsedMB: 0,
+    }));
+
+    const customers = [...bridgeCustomers, ...guideCustomers]
+      .sort((a, b) => new Date(b.signedUpAt) - new Date(a.signedUpAt));
 
     res.json(customers);
   } catch (err) {
@@ -2080,6 +2152,53 @@ app.get('/admin/leads', requireAdminKey, async (req, res) => {
   } catch (err) {
     console.error('Error building leads list:', err);
     res.status(500).json({ error: 'Error fetching leads' });
+  }
+});
+
+// Permanently remove a lead - someone who filled out the signup form
+// but never finished payment. Unlike delete-forever (real, paying
+// customers), this doesn't require typed email confirmation since
+// there's no paid relationship to protect - but the WHERE clause still
+// only ever matches a row that currently qualifies as a lead, so this
+// can't be pointed at a real customer just by guessing an id. Also
+// cleans up any emails/attachments that arrived before checkout was
+// ever finished, so nothing is left orphaned pointing at a
+// missionary_email that no longer exists.
+app.delete('/admin/leads/:id', requireAdminKey, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM missionaries WHERE id = $1 AND ${LEADS_WHERE}`,
+      [req.params.id]
+    );
+    const m = result.rows[0];
+    if (!m) {
+      return res.status(404).json({ error: 'Lead not found - it may have already paid or been removed' });
+    }
+
+    if (m.missionary_email) {
+      const attachmentsResult = await pool.query(
+        `SELECT a.saved_as FROM attachments a
+         JOIN emails e ON a.email_id = e.id
+         WHERE e.sender_email = $1`,
+        [m.missionary_email]
+      );
+      for (const row of attachmentsResult.rows) {
+        try {
+          await deleteFromR2(row.saved_as);
+        } catch (err) {
+          console.error(`Error deleting R2 file ${row.saved_as}:`, err.message);
+        }
+      }
+      await pool.query(`DELETE FROM emails WHERE sender_email = $1`, [m.missionary_email]);
+      await pool.query(`DELETE FROM dashboard_views WHERE LOWER(missionary_email) = $1`, [m.missionary_email.toLowerCase()]);
+    }
+
+    await pool.query(`DELETE FROM missionaries WHERE id = $1`, [req.params.id]);
+    console.log(`Deleted lead #${req.params.id} (${m.missionary_email || m.family_email})`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error deleting lead:', err);
+    res.status(500).json({ error: 'Error deleting lead' });
   }
 });
 
@@ -2375,7 +2494,10 @@ app.get('/admin/dashboard-activity', requireAdminKey, async (req, res) => {
 // page_views table (see /track/pageview above and db.js).
 app.get('/admin/analytics', requireAdminKey, async (req, res) => {
   try {
-    const days = String(Math.max(1, Math.min(365, parseInt(req.query.days, 10) || 30)));
+    // Capped well beyond any realistic "all time" range for this
+    // business rather than at 365, so the admin traffic chart can
+    // actually show the whole history since launch.
+    const days = String(Math.max(1, Math.min(3650, parseInt(req.query.days, 10) || 30)));
 
     const totals = await pool.query(
       `SELECT COUNT(*) as views, COUNT(DISTINCT visitor_id) as unique_visitors
