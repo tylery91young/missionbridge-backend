@@ -741,8 +741,11 @@ app.post('/webhook', upload.any(), async (req, res) => {
     const emailId = result.rows[0].id;
 
     // If we found a link we can't access, alert the family right away
-    // so they can save it themselves in time.
-    if (hasAnyUnparseableLink && missionary) {
+    // so they can save it themselves in time - unless this account has
+    // link alerts turned off (e.g. a big batch of old emails is being
+    // forwarded back in at once, where one alert per email would just
+    // be noise).
+    if (hasAnyUnparseableLink && missionary && !missionary.link_alerts_disabled) {
       const exampleLink = unfetchedDriveLinks[0] || photosLinksFound[0];
       const linkTypeLabel = hasPhotosLink ? 'Google Photos' : 'Google Drive';
 
@@ -2119,6 +2122,7 @@ app.get('/admin/customers', requireAdminKey, async (req, res) => {
           boughtPhotoGuide: guideAddOnIds.has(m.id),
           isComped: m.is_comped || false,
           secondaryEmail: m.secondary_sender_email,
+          linkAlertsDisabled: m.link_alerts_disabled || false,
           missionaryName: m.missionary_name,
           missionaryEmail: m.missionary_email,
           familyEmail: m.family_email,
@@ -2439,7 +2443,7 @@ app.post('/admin/customers/manual', requireAdminKey, async (req, res) => {
 // Admin: update a customer's paid amount or notes
 app.post('/admin/customers/:id', requireAdminKey, async (req, res) => {
   try {
-    const { paidAmount, notes, missionaryEmail, familyEmail, isComped, secondaryEmail, dashboardToken } = req.body;
+    const { paidAmount, notes, missionaryEmail, familyEmail, isComped, secondaryEmail, dashboardToken, linkAlertsDisabled } = req.body;
     await pool.query(
       `UPDATE missionaries SET
          paid_amount = COALESCE($1, paid_amount),
@@ -2448,8 +2452,9 @@ app.post('/admin/customers/:id', requireAdminKey, async (req, res) => {
          family_email = COALESCE(NULLIF($4, ''), family_email),
          is_comped = COALESCE($5, is_comped),
          secondary_sender_email = COALESCE(NULLIF($6, ''), secondary_sender_email),
-         dashboard_token = COALESCE(NULLIF($7, ''), dashboard_token)
-       WHERE id = $8`,
+         dashboard_token = COALESCE(NULLIF($7, ''), dashboard_token),
+         link_alerts_disabled = COALESCE($8, link_alerts_disabled)
+       WHERE id = $9`,
       [
         paidAmount, notes,
         missionaryEmail ? sanitizeMissionaryEmail(missionaryEmail) : null,
@@ -2457,6 +2462,7 @@ app.post('/admin/customers/:id', requireAdminKey, async (req, res) => {
         typeof isComped === 'boolean' ? isComped : null,
         secondaryEmail ? secondaryEmail.toLowerCase().trim() : null,
         dashboardToken ? dashboardToken.trim() : null,
+        typeof linkAlertsDisabled === 'boolean' ? linkAlertsDisabled : null,
         req.params.id,
       ]
     );
@@ -2587,7 +2593,23 @@ app.post('/admin/customers/:id/restore', requireAdminKey, async (req, res) => {
 // or a replayed request.
 app.post('/admin/customers/:id/delete-forever', requireAdminKey, async (req, res) => {
   try {
-    const { confirmEmail } = req.body;
+    const { confirmEmail, confirmPhrase } = req.body;
+
+    // This is the single remaining path in the whole system that can
+    // permanently destroy captured emails/attachments - after the
+    // Couch family incident, that's deliberate: it's the ONLY way this
+    // can happen, and it requires the admin key, the exact customer
+    // email typed as confirmEmail, AND this exact fixed phrase as a
+    // second, independent signal. The phrase is hardcoded into
+    // admin.html's own call below, so it costs Tyler nothing extra to
+    // click through - its only purpose is making sure nothing (a
+    // future feature, a copy-pasted curl command, a bug) can ever
+    // reach real deletion by accident, only through this exact,
+    // deliberate flow.
+    if (confirmPhrase !== 'DELETE FOREVER') {
+      return res.status(400).json({ error: 'Missing or incorrect confirmation phrase - nothing was deleted' });
+    }
+
     const result = await pool.query(`SELECT * FROM missionaries WHERE id = $1`, [req.params.id]);
     const m = result.rows[0];
     if (!m) {

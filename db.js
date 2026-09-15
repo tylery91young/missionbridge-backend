@@ -194,6 +194,16 @@ async function initDb() {
   await pool.query(`
     ALTER TABLE missionaries ADD COLUMN IF NOT EXISTS lead_dismissed_at TIMESTAMPTZ;
   `);
+  // Suppresses the "we found a link we can't save automatically"
+  // family alert for this missionary only. Added for catch-up
+  // situations like forwarding a big batch of already-lost history
+  // back in at once - normally one alert per email is exactly the
+  // point (tell the family right away, while they can still act on
+  // it), but that becomes spammy noise when many old emails are being
+  // recaptured in a burst instead of arriving one at a time.
+  await pool.query(`
+    ALTER TABLE missionaries ADD COLUMN IF NOT EXISTS link_alerts_disabled BOOLEAN DEFAULT FALSE;
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS waitlist (
