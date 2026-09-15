@@ -2118,6 +2118,7 @@ app.get('/admin/customers', requireAdminKey, async (req, res) => {
           customerType: 'bridge',
           boughtPhotoGuide: guideAddOnIds.has(m.id),
           isComped: m.is_comped || false,
+          secondaryEmail: m.secondary_sender_email,
           missionaryName: m.missionary_name,
           missionaryEmail: m.missionary_email,
           familyEmail: m.family_email,
